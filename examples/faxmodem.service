@@ -1,0 +1,31 @@
+# systemd unit for the spool daemon.
+#   cp examples/faxmodem.service /etc/systemd/system/
+#   systemctl enable --now faxmodem
+# Logs land in the journal because the daemon only ever writes to stdout.
+
+[Unit]
+Description=faxmodem - fax over SIP spool daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=faxmodem
+Group=faxmodem
+Environment=FAXMODEM_PASSWORD=
+EnvironmentFile=-/etc/default/faxmodem
+ExecStart=/usr/local/bin/faxmodem daemon --config /etc/faxmodem.conf
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# The daemon needs nothing but its spool and output directories.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/spool/faxmodem /var/lib/faxmodem
+
+[Install]
+WantedBy=multi-user.target

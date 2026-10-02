@@ -1,0 +1,13 @@
+# A spool job. Drop a file like this into <spool-dir>/queue/ (write it to
+# <spool-dir>/tmp/ first and rename it in, so the daemon never reads a partial
+# file), or let `faxmodem enqueue` do that for you.
+#
+# Any faxmodem option is accepted here and overrides the daemon's own setting
+# for this job only. 'attempts' and 'not-before' are maintained by the daemon.
+
+to          = +15551234567
+file        = /var/spool/faxmodem/documents/invoice-1043.tif
+ref         = invoice-1043
+station-id  = +15550001111
+header      = Acme Inc - invoice 1043
+attempts    = 0

@@ -1,0 +1,6 @@
+#ifndef FAXMODEM_VERSION_H
+#define FAXMODEM_VERSION_H
+
+#define FAXMODEM_VERSION "0.1.0"
+
+#endif /* FAXMODEM_VERSION_H */
