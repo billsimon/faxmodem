@@ -57,9 +57,41 @@ add_executable(faxmodem
   src/spool.c
   src/tiff_probe.c
   src/util.c
+  src/v34_codec.c
+  src/v34_dsp.c
+  src/v34_info.c
+  src/v34_cc.c
+  src/v34hdx.c
 )
 
 target_include_directories(faxmodem PRIVATE include "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
+# spandsp's T.30 engine and fax front end, vendored from 0.0.6 and patched for
+# V.34 (T.30 Annex F); they override the installed library's copies. See
+# third_party/spandsp-t30/README.md.
+set(T30_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/spandsp-t30")
+set(T30_SOURCES "${T30_DIR}/t30.c" "${T30_DIR}/t30_api.c" "${T30_DIR}/t30_logging.c" "${T30_DIR}/fax.c")
+target_sources(faxmodem PRIVATE ${T30_SOURCES})
+# They include spandsp's headers one by one, never <spandsp.h>, which is the
+# only place the installed library says whether it was built fixed point - and
+# the modem structures inside fax_state_t are laid out differently each way.
+# So read it from there, and tell the vendored files the same.
+set(T30_DEFS HAVE_CONFIG_H)
+find_file(SPANDSP_MAIN_HEADER spandsp.h PATHS ${SPANDSP_INCLUDE_DIRS} NO_DEFAULT_PATH)
+if(NOT SPANDSP_MAIN_HEADER)
+  message(FATAL_ERROR "cannot find the installed spandsp.h in ${SPANDSP_INCLUDE_DIRS}")
+endif()
+file(STRINGS "${SPANDSP_MAIN_HEADER}" _spandsp_fixed REGEX "^#define SPANDSP_USE_FIXED_POINT")
+if(_spandsp_fixed)
+  list(APPEND T30_DEFS SPANDSP_USE_FIXED_POINT=1)
+  message(STATUS "spandsp: fixed point build")
+else()
+  message(STATUS "spandsp: floating point build")
+endif()
+set_source_files_properties(${T30_SOURCES} PROPERTIES
+    COMPILE_OPTIONS "-w"
+    INCLUDE_DIRECTORIES "${T30_DIR}"
+    COMPILE_DEFINITIONS "${T30_DEFS}")
 target_link_libraries(faxmodem PRIVATE
   PkgConfig::PJPROJECT
   ${PJ_BUNDLED_LIBS}
@@ -127,3 +159,28 @@ install(FILES examples/faxmodem.conf DESTINATION share/faxmodem/examples)
 install(FILES examples/example.job DESTINATION share/faxmodem/examples)
 install(FILES examples/faxmodem.service DESTINATION share/faxmodem/examples)
 install(PROGRAMS scripts/make-test-page.sh DESTINATION bin RENAME faxmodem-make-test-page)
+
+# Unit tests for the parts of V.34 that have to agree with the far end bit for
+# bit, with no signal processing in between: `ctest`, or build/v34test.
+enable_testing()
+add_executable(v34test tests/v34_test.c src/v34_codec.c src/v34_info.c src/v34_dsp.c src/v34_cc.c src/log.c
+               src/util.c)
+target_include_directories(v34test PRIVATE src include "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_compile_options(v34test PRIVATE -Wall -Wextra -Wno-unused-parameter -Wshadow)
+target_link_libraries(v34test PRIVATE Threads::Threads)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(v34test PRIVATE m)
+endif()
+add_test(NAME v34 COMMAND v34test)
+
+# Two half-duplex V.34 modems back to back over a simulated line: start-up,
+# the control channel both ways, pages on the primary channel.
+add_executable(v34hdxtest tests/v34hdx_test.c src/v34hdx.c src/v34_cc.c src/v34_codec.c src/v34_info.c
+               src/v34_dsp.c src/log.c src/util.c)
+target_include_directories(v34hdxtest PRIVATE src include "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_compile_options(v34hdxtest PRIVATE -Wall -Wextra -Wno-unused-parameter -Wshadow)
+target_link_libraries(v34hdxtest PRIVATE PkgConfig::SPANDSP PkgConfig::TIFF Threads::Threads)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(v34hdxtest PRIVATE m)
+endif()
+add_test(NAME v34hdx COMMAND v34hdxtest)

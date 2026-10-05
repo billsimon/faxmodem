@@ -3,6 +3,10 @@
 # crosses real SIP signalling and RTP on the loopback interface.
 #
 #   scripts/loopback-test.sh [path/to/faxmodem]
+#
+# V34=1 runs both ends with --v34 and fails unless the call ran as V.34
+# (Super G3); V34_MAX_RATE caps it. DOC=file.tif sends that document instead
+# of building one with ghostscript.
 set -euo pipefail
 
 BIN=${1:-build/faxmodem}
@@ -12,6 +16,14 @@ TX_PORT=${TX_PORT:-5070}
 RX_RTP=${RX_RTP:-4100}
 TX_RTP=${TX_RTP:-4200}
 PAGES=${PAGES:-2}
+V34=${V34:-0}
+DOC=${DOC:-}
+
+MODEM_ARGS=()
+if [ "$V34" = 1 ]; then
+    MODEM_ARGS+=(--v34)
+    [ -n "${V34_MAX_RATE:-}" ] && MODEM_ARGS+=(--v34-max-rate "$V34_MAX_RATE")
+fi
 
 cleanup() {
     [ -n "${RX_PID:-}" ] && kill "$RX_PID" 2>/dev/null || true
@@ -25,8 +37,12 @@ trap cleanup EXIT
     exit 1
 }
 
-echo "==> building a $PAGES page test document"
-"$(dirname "$0")/make-test-page.sh" "$WORK/testpage.tif" "$PAGES" >/dev/null
+if [ -n "$DOC" ]; then
+    cp "$DOC" "$WORK/testpage.tif"
+else
+    echo "==> building a $PAGES page test document"
+    "$(dirname "$0")/make-test-page.sh" "$WORK/testpage.tif" "$PAGES" >/dev/null
+fi
 "$BIN" probe "$WORK/testpage.tif"
 
 echo "==> starting the receiver on port $RX_PORT"
@@ -37,6 +53,7 @@ echo "==> starting the receiver on port $RX_PORT"
     --local-port "$RX_PORT" \
     --rtp-port "$RX_RTP" \
     --station-id "RX-STATION" \
+    ${MODEM_ARGS[@]+"${MODEM_ARGS[@]}"} \
     --timeout 1800 \
     --output-dir "$WORK/inbox" >"$WORK/receive.log" 2>&1 &
 RX_PID=$!
@@ -54,7 +71,8 @@ set +e
     --no-register \
     --local-port "$TX_PORT" \
     --rtp-port "$TX_RTP" \
-    --station-id "+15550001111" | tee "$WORK/send.log"
+    --station-id "+15550001111" \
+    ${MODEM_ARGS[@]+"${MODEM_ARGS[@]}"} | tee "$WORK/send.log"
 SEND_RC=${PIPESTATUS[0]}
 set -e
 
@@ -76,6 +94,14 @@ echo "==> received $RECEIVED ($GOT_PAGES pages, sent $SENT_PAGES)"
     echo "FAILED: page count mismatch"
     exit 1
 }
+
+if [ "$V34" = 1 ]; then
+    grep -q "call finished.* v34=yes" "$WORK/send.log" || {
+        echo "FAILED: the call did not run as V.34"
+        exit 1
+    }
+    echo "==> ran as V.34: $(grep -o 'bit_rate=[0-9]*' "$WORK/send.log" | tail -1)"
+fi
 
 # Page counts only prove pages arrived, not that they arrived intact.
 if command -v tiffcmp >/dev/null 2>&1; then

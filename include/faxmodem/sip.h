@@ -19,6 +19,7 @@ typedef struct
     int pages;
     int bit_rate;
     bool ecm;
+    bool v34;              /* ran as V.34 (Super G3) */
     int duration_ms;
     char remote_ident[41];
 } fm_call_result_t;

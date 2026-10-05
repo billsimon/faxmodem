@@ -40,6 +40,13 @@ scripts/make-test-page.sh "$WORK/page.tif" 2 >/dev/null
 "$BIN" probe "$WORK/page.tif" >/dev/null
 "$BIN" selftest "$WORK/page.tif" --output-dir "$WORK/out" --log-level warn
 echo "    selftest: T.30 engine OK"
+"$BIN" selftest "$WORK/page.tif" --output-dir "$WORK/out34" --v34 --log-level info >"$WORK/selftest-v34.log" 2>&1 &&
+    grep -q "transfer finished.* v34=yes" "$WORK/selftest-v34.log" || {
+    echo "    V.34 selftest FAILED - see $WORK/selftest-v34.log"
+    tail -20 "$WORK/selftest-v34.log"
+    exit 1
+}
+echo "    selftest: V.34 OK"
 
 if [ "${SKIP_LOOPBACK:-0}" != "1" ]; then
     scripts/loopback-test.sh "$BIN" >"$WORK/loopback.log" 2>&1 || {

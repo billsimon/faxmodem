@@ -204,6 +204,8 @@ The settings that matter most in practice:
 | `--station-id` | — | Your TSI/CSI, the number the far machine prints. Max 20 chars. |
 | `--ecm` / `--no-ecm` | on | Error correction. Turn it off for very poor lines. |
 | `--max-speed` | `14400` | Cap the modem: `14400` (V.17), `9600`/`7200` (V.29), `4800` (V.27ter). |
+| `--v34` | off | Offer V.34 "Super G3", up to 33600. Falls back to the above with a G3 machine. See [V.34](#v34-super-g3). |
+| `--v34-max-rate` | `33600` | Cap V.34's page rate: a multiple of 2400 from 2400 to 33600. |
 | `--timeout` | `600` send / `28800` receive | Deadline for a single fax. Sending scales it to the page count; receiving cannot know the page count, so its default is a backstop measured in hours. |
 | `--seconds-per-page` | `90` | Per-page budget used for that scaling. |
 | `--log-level` | `info` | `error`/`warn`/`info`/`debug`/`trace`. `-v` bumps it. |
@@ -300,6 +302,66 @@ Note that P-Asserted-Identity is only honoured inside a trusted domain — a
 carrier that has not agreed to trust your identity assertions will ignore it
 and bill/present the account number instead.
 
+## V.34 (Super G3)
+
+`--v34` offers V.34 half duplex fax (T.30 Annex F, "Super G3"): pages at up to
+33600 bit/s instead of V.17's 14400, so a page takes a third to half as long.
+It is off by default. With it on:
+
+- **Answering**, faxmodem sends ANSam in place of CED. A Super G3 caller
+  answers with V.8 and the call runs on V.34; a G3 caller ignores ANSam and
+  the call carries on as G3, exactly as without `--v34`.
+- **Calling**, faxmodem listens for ANSam alongside its usual CNG and V.21
+  receiver. A Super G3 answerer's ANSam leads to V.8 and V.34; a G3
+  answerer's DIS settles it as G3.
+- Under V.34 there is no TCF and **ECM is always on**, whatever `--ecm` says.
+  T.30's frames go over V.34's 1200 bit/s control channel, and pages over the
+  primary channel at the rate line probing and training picked, capped by
+  `--v34-max-rate`. `--max-speed` only matters when the call falls back to G3.
+
+The V.34 modem is faxmodem's own (`src/v34hdx.c`, `src/v34_*.c`), so unlike
+V.17 it is unaffected by a fixed point spandsp and gives 33600 on Apple Silicon
+too. T.30 is spandsp's, with the Annex F changes, vendored in
+`third_party/spandsp-t30/` (its README lists them); it overrides the
+installed library's copy, which must be spandsp 0.0.6.
+
+The log says which way a call went. `v34=yes` and the page rate appear in the
+`page complete`, `transfer finished`, `call finished` and `fax received` lines
+and in spool `.result` files, and `--log-level debug` traces V.8, the
+start-up phases, line probing, the rate chosen and each control and primary
+channel turnaround under `[v34]`:
+
+```
+info  [fax] page complete tag=out pages_tx=1 pages_rx=0 bit_rate=33600 v34=yes ecm=yes bad_rows=0 frame=MCF
+```
+
+To try it against a real Super G3 machine:
+
+```sh
+# send to it
+faxmodem send 15551234567 doc.tif --v34 --log-level debug
+# have it call us
+faxmodem receive --v34 --output-dir ./inbox --log-level debug
+# a poor line: cap the rate rather than let it fail
+faxmodem send 15551234567 doc.tif --v34 --v34-max-rate 24000
+```
+
+What is not implemented yet, and what it means in practice:
+
+- **Retrains.** Neither channel retrains mid-call (V.34 12.7, and the control
+  channel's response to AC). Each page's primary channel resynchronises
+  from scratch, so drift and level changes between pages are handled, but a
+  line that changes sharply within a page takes ECM retransmissions rather
+  than a retrain, and the rate chosen at start-up holds for the call. If a
+  line stalls, `--v34-max-rate` lower is the lever.
+- **The answerer as the source** (12.2.2): polling, or an answerer with
+  pages of its own to send at start-up. faxmodem declines V.34 in that case
+  and the call runs as G3.
+- **The 2400 bit/s control channel**, only used with asymmetric rates, which
+  faxmodem never offers.
+- V.34 has been tested modem-to-modem and over SIP/RTP between two faxmodems,
+  not yet against another vendor's implementation.
+
 ## The spool daemon
 
 ```
@@ -332,6 +394,7 @@ t30-text=OK
 pages=2
 bit-rate=9600
 ecm=yes
+v34=no
 remote-id=RX-STATION
 duration-ms=45616
 ```
@@ -371,13 +434,26 @@ It is a test hook, not an option:
 FAXMODEM_SELFTEST_LINE="delay=150,echo=-20,ulaw" faxmodem selftest invoice.tif --output-dir /tmp/out
 ```
 
+`--v34` works with `selftest` too, alone or with a `FAXMODEM_SELFTEST_LINE`
+(the `transfer finished` line should say `v34=yes`). The V.34 modem has
+its own tests, built beside faxmodem and run by `ctest --test-dir build`:
+`v34test` covers the coding, INFO and control channel layers, and
+`v34hdxtest` runs two half duplex modems through V.8, start-up and pages
+over a simulated line - `v34hdxtest [delay loss noise cap pages ppm seed]`
+for one line, `v34hdxtest soak 100` for a hundred random ones (delay, loss,
+noise, clock drift, G.711, echo).
+
 `scripts/loopback-test.sh` goes further: it starts a receiver on 127.0.0.1,
 sends it a fax from a second process over real SIP and real RTP, and compares
 page counts. That exercises everything except your carrier.
 
 ```sh
 cmake --build build && scripts/loopback-test.sh
+V34=1 scripts/loopback-test.sh          # both ends with --v34; fails unless it ran as V.34
 ```
+
+`DOC=file.tif` sends that document instead of building one with ghostscript,
+and `RX_PORT`, `TX_PORT`, `RX_RTP` and `TX_RTP` move it off ports in use.
 
 ## Exit codes
 
@@ -448,6 +524,8 @@ T.30; a partial transfer is logged as such and the TIFF flagged as incomplete.
   bridge share the same clock and tend to interfere.
 - **No PDF conversion.** Use ghostscript, as above.
 - **Sending is one document per call**, no polling, no subaddressing.
+- **V.34 without retrains**, and never with the answerer sending; see
+  [V.34](#v34-super-g3).
 
 ## Layout
 
@@ -456,6 +534,10 @@ src/main.c        command dispatch, signals
 src/config.c      flags, environment, config files (one option table drives all three)
 src/log.c         stdout logging, queued off the media thread; pjsip and spandsp are routed through it
 src/fax.c         spandsp T.30 engine, phase B/D/E handlers, in-memory selftest
+src/v34hdx.c      half duplex V.34 modem: V.8, start-up, control and primary channels
+src/v34_cc.c      V.34's control channel modem
+src/v34_*.c       V.34 coding, DSP and INFO/MP messages
+third_party/spandsp-t30/  spandsp's T.30 and fax front end with T.30 Annex F
 src/sip.c         pjsua setup, registration, calls, and the fax pjmedia port
 src/spool.c       the queue: claim, send, retry, result files
 src/tiff_probe.c  pre-flight document checks

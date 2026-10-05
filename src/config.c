@@ -74,6 +74,9 @@ static const opt_def_t OPTS[] = {
     STR_OPT("header", header, "page header text (empty disables)"),
     BOOL_OPT("ecm", ecm, "error correction mode (default on)"),
     INT_OPT("max-speed", max_speed, 2400, 14400, "ceiling modem speed: 14400, 9600 or 4800"),
+    BOOL_OPT("v34", v34, "offer V.34 (Super G3): up to 33600 bit/s, ECM always (default off)"),
+    INT_OPT("v34-max-rate", v34_max_rate, 2400, 33600,
+            "V.34 ceiling, bit/s, a multiple of 2400 (default 33600)"),
     BOOL_OPT("fine-only", fine_resolution_only, "refuse standard resolution on receive"),
     BOOL_OPT("unlimited-page-length", unlimited_page_length,
              "advertise unbounded page length; lets a stuck sender feed rows forever"),
@@ -133,6 +136,8 @@ void fm_config_defaults(fm_config_t *cfg)
     cfg->jitter_buffer_ms = 150;
     cfg->ecm = true;
     cfg->max_speed = 14400;
+    cfg->v34 = false;
+    cfg->v34_max_rate = 33600;
     cfg->timeout_s = 600;
     cfg->inbound_timeout_s = FM_INBOUND_TIMEOUT_DEFAULT;
     cfg->seconds_per_page = 90;
@@ -614,6 +619,11 @@ static bool needs_sip(fm_command_t cmd)
 
 bool fm_config_validate(const fm_config_t *cfg, char *err, size_t err_len)
 {
+    if (cfg->v34_max_rate % 2400 != 0)
+    {
+        snprintf(err, err_len, "--v34-max-rate must be a multiple of 2400 (2400 ... 33600)");
+        return false;
+    }
     if (needs_sip(cfg->command))
     {
         if (cfg->server[0] == '\0')
@@ -683,8 +693,10 @@ void fm_config_log(const fm_config_t *cfg)
              cfg->server, cfg->username, cfg->auth_user[0] ? cfg->auth_user : cfg->username,
              cfg->password[0] ? "<set>" : "<unset>", cfg->do_register ? "yes" : "no", cfg->transport,
              cfg->local_port);
-    FM_DEBUG("config", "codec=%s jitter_buffer_ms=%d ecm=%s max_speed=%d station_id=%s timeout=%ds",
-             cfg->codec, cfg->jitter_buffer_ms, cfg->ecm ? "on" : "off", cfg->max_speed, cfg->station_id,
+    FM_DEBUG("config", "codec=%s jitter_buffer_ms=%d ecm=%s max_speed=%d v34=%s v34_max_rate=%d station_id=%s "
+                       "timeout=%ds",
+             cfg->codec, cfg->jitter_buffer_ms, cfg->ecm ? "on" : "off", cfg->max_speed, cfg->v34 ? "on" : "off",
+             cfg->v34_max_rate, cfg->station_id,
              cfg->timeout_s);
 }
 
