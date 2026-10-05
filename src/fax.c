@@ -100,13 +100,13 @@ static void attach_logging(logging_state_t *lg, const char *tag)
 
 /* spandsp 0.0.6 builds itself fixed point on any host its configure script
  * calls "arm" - which, through an old config.guess, includes Apple Silicon
- * Macs - and its fixed point V.17 does not work: it trains, then demodulates
- * nothing but noise, at every rate. T.30 copes - TCF fails at 14400 and 12000
- * and the call settles at 9600 - but every call spends two failed trainings
- * getting there, and as a receiver we would advertise a modem we cannot
- * receive. So V.17 is tried once, back to back, before it is offered. A
- * floating point spandsp passes; so would a fixed point one that had been
- * fixed. -1 until fm_fax_check_modems() has run. */
+ * Macs - and its fixed point V.17 receiver does not work: it trains, then
+ * demodulates nothing but noise, at every rate. third_party/spandsp/v17rx.c
+ * fixes it, but should a broken V.17 ever be linked in again, T.30 would cope
+ * badly - TCF fails at 14400 and 12000 and the call settles at 9600 after two
+ * failed trainings, and as a receiver we would advertise a modem we cannot
+ * receive. So V.17 is tried once, back to back, before it is offered. -1
+ * until fm_fax_check_modems() has run. */
 static int g_v17_ok = -1;
 
 typedef struct

@@ -1,4 +1,4 @@
-/* V.34 for spandsp's fax front end: what third_party/spandsp-t30/fax.c adds
+/* V.34 for spandsp's fax front end: what third_party/spandsp/fax.c adds
  * to fax_state_t to run T.30 Annex F ("Super G3") over the half-duplex V.34
  * modem of v34hdx.c.
  *
