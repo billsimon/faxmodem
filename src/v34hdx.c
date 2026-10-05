@@ -285,6 +285,8 @@ struct fm_v34h
 
     /* receive */
     fsk_rx_state_t *fsk_rx;
+    float bpf[2][5];          /* V.8's receiver: the far end's V.21 channel, two biquads */
+    float bpz[2][2];
     modem_connect_tones_rx_state_t *ansam_rx;
     uint32_t v8_sr;
     int v8_bitcnt;
@@ -308,6 +310,7 @@ struct fm_v34h
     long long probe_from;
     qrx_t q;
     bool p3_training;         /* the receiver is in Phase 3, not a 12.5 resynchronisation */
+    double far_tfreq;         /* the source's clock against ours, as Phase 3 found it */
     v34_dec_t dec;
     v34_enc_t b1ref;
     v34_cf_t b1u[256];
@@ -320,6 +323,7 @@ struct fm_v34h
 
     v34_ccrx_t ccrx;
     bool ccrx_on;
+    double cc_tfreq;          /* the far end's control channel clock, as last found */
     uint32_t cc_sr;
     int cc_ones;
     bool cc_in_mph;
@@ -538,8 +542,45 @@ static void v8_put_bit(void *user, int bit)
     }
 }
 
+/* Two band-pass biquads (the RBJ cookbook's, Q 2) around the far end's V.21
+ * channel: 980/1180 Hz for the caller's CM, 1650/1850 Hz for the answerer's
+ * JM. spandsp's receiver has nothing in front of it, and our own signal
+ * comes back through the hybrid: the answerer's own ANSam, still going, was
+ * 10 dB stronger than a weak caller's CM and drowned it. About 19 dB off
+ * ANSam, 14 off our own CM, half a dB on the wanted tones. */
+static void v8_bpf_init(fm_v34h_t *v)
+{
+    double f0 = v->calling ? 1750.0 : 1080.0;
+    double w = 2.0 * PI * f0 / 8000.0, alpha = sin(w) / (2.0 * 2.0), a0 = 1.0 + alpha;
+
+    for (int k = 0; k < 2; k++)
+    {
+        v->bpf[k][0] = (float) (alpha / a0);
+        v->bpf[k][1] = 0.0f;
+        v->bpf[k][2] = (float) (-alpha / a0);
+        v->bpf[k][3] = (float) (-2.0 * cos(w) / a0);
+        v->bpf[k][4] = (float) ((1.0 - alpha) / a0);
+        v->bpz[k][0] = v->bpz[k][1] = 0.0f;
+    }
+}
+
+static float v8_bpf(fm_v34h_t *v, float x)
+{
+    for (int k = 0; k < 2; k++)
+    {
+        /* Transposed direct form II */
+        float y = v->bpf[k][0] * x + v->bpz[k][0];
+
+        v->bpz[k][0] = v->bpf[k][1] * x - v->bpf[k][3] * y + v->bpz[k][1];
+        v->bpz[k][1] = v->bpf[k][2] * x - v->bpf[k][4] * y;
+        x = y;
+    }
+    return x;
+}
+
 static void v8_start_rx(fm_v34h_t *v)
 {
+    v8_bpf_init(v);
     if (v->fsk_rx != NULL)
         fsk_rx_free(v->fsk_rx);
     v->fsk_rx = fsk_rx_init(NULL, &preset_fsk_specs[v->calling ? FSK_V21CH2 : FSK_V21CH1], FSK_FRAME_MODE_ASYNC,
@@ -1657,9 +1698,15 @@ static void p3_heard_sbar(fm_v34h_t *v)
 static void ccrx_listen(fm_v34h_t *v, bool fresh)
 {
     if (fresh || !v->ccrx_on)
+    {
         v34_ccrx_init(&v->ccrx, v->calling, v->nominal_dbm0);
+        /* The far end's clock is the same clock every time. */
+        v->ccrx.tfreq = v->cc_tfreq;
+    }
     else
+    {
         v34_ccrx_reset_sync(&v->ccrx);
+    }
     v->ccrx_on = true;
     v->cc_sr = 0;
     v->cc_ones = 0;
@@ -1701,6 +1748,8 @@ static void p3_done(fm_v34h_t *v)
 {
     qrx_t *q = &v->q;
 
+    /* The source's clock is the same clock on every page. */
+    v->far_tfreq = q->tfreq;
     if (q->trn_err_n > 50)
         v->snr_db = snr_from_mse((float) (q->trn_err / q->trn_err_n));
     else
@@ -1913,6 +1962,7 @@ void fm_v34h_primary(fm_v34h_t *v)
     if (v->stage != ST_CC_DATA)
         return;
     v->cc_up_said = false;
+    v->cc_tfreq = v->ccrx.tfreq;
     if (v->source)
     {
         /* 12.6.3.1: 4T of scrambled ones, then 12.5.1. Our receiver is
@@ -1932,6 +1982,9 @@ void fm_v34h_primary(fm_v34h_t *v)
         v->ccrx_on = false;
         v->rx_in_data = false;
         qrx_start(v, v->sr, v->high);
+        /* A resynchronisation trains on PP alone, too short to find the
+         * source's clock again: start from what Phase 3 found. */
+        v->q.tfreq = v->far_tfreq;
         v->p3_training = false;
         v->quiet_since = 0;
         stage_enter(v, ST_PC_RX, 10.0);
@@ -2274,9 +2327,17 @@ static void control(fm_v34h_t *v, long long n, double rev, bool reversed)
         }
         break;
     case ST_C2_L:
-        /* 12.2.1.1.4: tone A while L2 goes out. */
-        if (v->p2_l2_at < 0 && v->p2tx.probe && tone && n - r->tone_since > MS(30) &&
-            n > v->rev_sent + MS(10 + 160 + 100))
+        /* The recipient listens to L2 for 500 ms at most (12.2.1.2.5); after
+         * that L2 only hides tone A behind our own echo - 10 dB stronger
+         * than A over a line with 30 dB of loss. So L2 stops, and tone A is
+         * waited for in silence. */
+        if (v->p2_l2_at < 0 && v->p2tx.probe && v->ntx > v->rev_sent + MS(10 + 160 + 650))
+        {
+            v34_p2tx_probe(&v->p2tx, false, false, v->nominal_dbm0);
+            v->txm = TXM_SILENCE;
+        }
+        /* 12.2.1.1.4: tone A. */
+        if (v->p2_l2_at < 0 && tone && n - r->tone_since > MS(30) && n > v->rev_sent + MS(10 + 160 + 100))
         {
             p2_carrier(v, true);
             info_bits_reset(v, V34_INFOH_BITS);
@@ -2587,7 +2648,7 @@ static void rx_sample(fm_v34h_t *v, float x)
     case ST_V8_A_ANSAM:
     case ST_V8_A_JM:
     {
-        int16_t s = (int16_t) lrintf(x);
+        int16_t s = (int16_t) lrintf(v8_bpf(v, x));
 
         if (v->fsk_rx != NULL)
             fsk_rx(v->fsk_rx, &s, 1);

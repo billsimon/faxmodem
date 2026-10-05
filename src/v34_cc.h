@@ -99,6 +99,7 @@ typedef struct
     int parity;                         /* which T/2 samples are symbol centres */
     float pwr;                          /* T/2 sample power, smoothed */
     float pwr_sym;
+    float epar[2];                      /* T/2 sample power at each phase */
     float floor_;                       /* below this the far end is silent */
 
     /* recognising signals, at T/2 */
@@ -128,6 +129,7 @@ typedef struct
     uint8_t bits[16];
     int nbits;
     bool carrier;                       /* circuit 109 */
+    int off_count;                      /* T/2 samples the level has been below the off threshold */
 } v34_ccrx_t;
 
 void v34_ccrx_init(v34_ccrx_t *r, bool far_is_answerer, double nominal_dbm0);

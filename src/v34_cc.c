@@ -131,8 +131,10 @@ float v34_cctx_sample(v34_cctx_t *t)
 
 /* ------------------------------------------------------------- receiver */
 
-/* 6.6.2: circuit 109 on above -43 dBm0, off below -48. */
-#define ON_DB -43.0
+/* 6.6.2: circuit 109 must be on above -43 dBm0 and off below -48, with 2 dB
+ * of hysteresis or more; where in between is ours. As low as allowed, for
+ * the weak line. */
+#define ON_DB -46.0
 #define OFF_DB -48.0
 
 void v34_ccrx_init(v34_ccrx_t *r, bool far_is_answerer, double nominal_dbm0)
@@ -324,12 +326,16 @@ static int half(v34_ccrx_t *r, v34_cf_t y)
     long long idx = r->nh++;
     v34_cf_t y4, y2, prod;
     float p = crealf(y) * crealf(y) + cimagf(y) * cimagf(y);
-    float on = r->floor_ * r->floor_ * (float) pow(10.0, ON_DB / 10.0);
-    float off = r->floor_ * r->floor_ * (float) pow(10.0, OFF_DB / 10.0);
+    /* The input is already scaled so that 0 dBm0 is unit power here; these
+     * once carried that scale a second time, putting 109's threshold some
+     * 70 dB down, where line noise turned it on. */
+    float on = (float) pow(10.0, ON_DB / 10.0);
+    float off = (float) pow(10.0, OFF_DB / 10.0);
     int ev = 0;
 
     r->h[idx % V34_CC_H] = y;
     r->pwr += 0.05f * (p - r->pwr);
+    r->epar[idx & 1] += 0.1f * (p - r->epar[idx & 1]);
     if (!r->carrier && r->pwr > on)
     {
         r->carrier = true;
@@ -338,9 +344,16 @@ static int half(v34_ccrx_t *r, v34_cf_t y)
     }
     else if (r->carrier && r->pwr < off)
     {
-        r->carrier = false;
-        v34_ccrx_reset_sync(r);
+        /* 6.6.2: off 20 to 25 ms after the level falls - not at the first
+         * dip of a weak signal's measured level. */
+        if (++r->off_count >= (int) (0.02 * 2 * V34_CC_BAUD))
+        {
+            r->carrier = false;
+            v34_ccrx_reset_sync(r);
+        }
     }
+    if (r->pwr >= off)
+        r->off_count = 0;
     if (idx < 32 || r->pwr < off)
         return 0;
 
@@ -385,6 +398,12 @@ static int half(v34_ccrx_t *r, v34_cf_t y)
             {
                 r->s_seen = false;
                 r->sbar_at = idx;
+                /* Sh tells Gardner's detector nothing - its symbol-to-symbol
+                 * differences are always at right angles to the midpoints -
+                 * but its symbol centres carry 3 dB more than its midpoints:
+                 * which T/2 phase is which puts the clock within a quarter
+                 * symbol before ALT, from which the loop pulls in quickly. */
+                r->parity = (r->epar[1] > r->epar[0]) ? 1 : 0;
                 /* The level is the far end's own now, not a silence's. */
                 if (r->pwr_sym > 0.0f)
                     rescale(r);
@@ -433,7 +452,8 @@ static int half(v34_ccrx_t *r, v34_cf_t y)
         v34_cf_t mid = r->h[(idx - 1) % V34_CC_H];
         float e = crealf((y - y2) * conjf(mid));
         float sp = r->pwr_sym > 0.0f ? r->pwr_sym : p;
-        double kp = (r->symbols < 40) ? 0.06 : 0.015;
+        bool acquiring = r->symbols < 40;
+        double kp = acquiring ? 0.06 : 0.015;
 
         r->pwr_sym += 0.1f * (p - r->pwr_sym);
         if (sp > 0.0f)
@@ -444,11 +464,16 @@ static int half(v34_ccrx_t *r, v34_cf_t y)
             else if (e < -0.5f)
                 e = -0.5f;
             r->tau -= kp * e * T2;
-            r->tfreq -= kp * kp / 4.0 * e * T2;
-            if (r->tfreq > 0.0005 * T2)
-                r->tfreq = 0.0005 * T2;
-            else if (r->tfreq < -0.0005 * T2)
-                r->tfreq = -0.0005 * T2;
+            /* The clock's rate is learnt only once the phase has been
+             * found, and gently: learnt during the quick pull-in, it
+             * wandered to its limits - 500 ppm, where the far end may be
+             * 100 out - and carried there into the next session. */
+            if (!acquiring)
+                r->tfreq -= kp * kp / 8.0 * e * T2;
+            if (r->tfreq > 0.0002 * T2)
+                r->tfreq = 0.0002 * T2;
+            else if (r->tfreq < -0.0002 * T2)
+                r->tfreq = -0.0002 * T2;
         }
         if (r->carrier)
             ev |= symbol(r, y);

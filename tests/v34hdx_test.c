@@ -3,9 +3,11 @@
  * ways on it, a page on the primary channel, back to the control channel,
  * and again. Every bit is checked.
  *
- *   build/v34hdxtest [delay_ms] [loss_db] [noise_dbm0] [max_rate] [pages]
+ *   build/v34hdxtest [delay_ms] [loss_db] [noise_dbm0] [max_rate] [pages] [ppm] [seed]
+ *   build/v34hdxtest soak [runs] [first_seed]
  *
- * With no arguments, runs a small matrix of lines. */
+ * With no arguments, runs a small matrix of lines; soak runs random ones and
+ * prints, for each failure, the arguments that repeat it. */
 #include "faxmodem/log.h"
 #include "faxmodem/v34hdx.h"
 #include "v34_dsp.h"
@@ -96,6 +98,9 @@ static void check_bit(check_t *c, int bit, long long now)
 
     if (fresh)
     {
+        if (getenv("V34_PAGES") && c->ref.count > 0)
+            fprintf(stderr, "    session %lld: %lld of %lld right before the first error\n", c->ref.sessions,
+                    c->good, c->ref.count);
         if (c->good >= c->expect && c->expect > 0)
             c->sessions_ok++;
         c->good = 0;
@@ -195,18 +200,72 @@ typedef struct
     int delay;
     double gain;
     double noise;
+    double ppm;               /* the sender's clock against the receiver's */
 } path_t;
+
+/* Fractional delay by windowed sinc. V.34 at 3429 baud reaches 3.85 kHz,
+ * close to Nyquist: linear interpolation took several dB off the top of the
+ * band, and a short sinc's error there, changing as the fractional delay
+ * drifts round, made bursts of errors every second that the modems then got
+ * the blame for. 96 taps with a Kaiser window are accurate to that edge. */
+#define SINC_TAPS 96
+#define SINC_PHASES 512
+static float sinc_tab[SINC_PHASES + 1][SINC_TAPS];
+static bool sinc_ready;
+
+static double bessel_i0(double x)
+{
+    double sum = 1.0, term = 1.0;
+
+    for (int k = 1; k < 30; k++)
+    {
+        term *= (x / (2.0 * k)) * (x / (2.0 * k));
+        sum += term;
+    }
+    return sum;
+}
+
+static void sinc_init(void)
+{
+    for (int p = 0; p <= SINC_PHASES; p++)
+    {
+        double f = (double) p / SINC_PHASES;
+
+        for (int k = 0; k < SINC_TAPS; k++)
+        {
+            double t = (double) (k - SINC_TAPS / 2 + 1) - f;
+            double sinc = (fabs(t) < 1e-9) ? 1.0 : sin(3.14159265358979 * t) / (3.14159265358979 * t);
+            double r = t / (SINC_TAPS / 2);
+            double w = (fabs(r) < 1.0) ? bessel_i0(8.0 * sqrt(1.0 - r * r)) / bessel_i0(8.0) : 0.0;
+
+            sinc_tab[p][k] = (float) (sinc * w);
+        }
+    }
+    sinc_ready = true;
+}
 
 static float path_run(path_t *p, long long n, float x)
 {
-    float y;
+    /* A sender whose clock runs ppm fast: its samples come that much
+     * quicker, and the delay shrinks. 120 samples in hand cover 100 ppm for
+     * the two minutes a run may last. */
+    double at = (double) n - p->delay - 160.0 + (double) n * p->ppm * 1e-6;
+    long long i0 = (long long) floor(at);
+    int ph = (int) lrint((at - (double) i0) * SINC_PHASES);
+    float y = 0.0f;
 
+    if (!sinc_ready)
+        sinc_init();
     p->buf[n & 16383] = x;
-    y = (n >= p->delay) ? p->buf[(n - p->delay) & 16383] : 0.0f;
+    /* Taps reach SINC_TAPS/2 ahead, which the 120 samples in hand allow. */
+    if (i0 - SINC_TAPS >= 0 && i0 + SINC_TAPS / 2 <= n)
+        for (int k = 0; k < SINC_TAPS; k++)
+            y += p->buf[(i0 + k - SINC_TAPS / 2 + 1) & 16383] * sinc_tab[ph][k];
     return (float) (y * p->gain + p->noise * gauss());
 }
 
-static int run(int delay_ms, double loss_db, double noise_dbm0, int max_rate, int pages, bool verbose)
+static int run(int delay_ms, double loss_db, double noise_dbm0, int max_rate, int pages, double ppm, unsigned seed,
+               bool verbose)
 {
     static side_t a, b;
     static path_t ab, ba;
@@ -218,6 +277,8 @@ static int run(int delay_ms, double loss_db, double noise_dbm0, int max_rate, in
     int ok = 1;
     fm_v34h_stats_t sa, sb;
 
+    /* Each run its own noise, so that any one can be repeated. */
+    grng = seed ? seed : 12345;
     memset(&a, 0, sizeof(a));
     memset(&b, 0, sizeof(b));
     memset(&ab, 0, sizeof(ab));
@@ -238,6 +299,8 @@ static int run(int delay_ms, double loss_db, double noise_dbm0, int max_rate, in
     ab.delay = ba.delay = delay_ms * 8;
     ab.gain = ba.gain = pow(10.0, -loss_db / 20.0);
     ab.noise = ba.noise = V34_DBM0_RMS * pow(10.0, noise_dbm0 / 20.0);
+    ab.ppm = ppm;
+    ba.ppm = -ppm;
 
     pa.calling = true;
     pa.max_rate = max_rate;
@@ -332,10 +395,11 @@ out:
     fm_v34h_stats(a.m, &sa);
     fm_v34h_stats(b.m, &sb);
     if (verbose || phase != 3)
-        printf("  delay %d ms, loss %.0f dB, noise %.0f dBm0, cap %d: %s; %d bit/s at %d baud, SNR %.1f dB, round trip "
+        printf("  [%u] delay %d ms, loss %.0f dB, noise %.0f dBm0, %+.0f ppm, cap %d: %s; %d bit/s at %d baud, SNR %.1f dB, "
+               "round trip "
                "%d ms; control channel sessions clean %lld/%lld one way, %lld/%lld the other; pages clean "
                "%lld/%d\n",
-               delay_ms, loss_db, noise_dbm0, max_rate,
+               seed, delay_ms, loss_db, noise_dbm0, ppm, max_rate,
                phase == 3 ? "done" : (a.failed || b.failed) ? "FAILED" : (a.not_v34 || b.not_v34) ? "NOT V.34" : "stuck",
                sb.rate, sb.symbol_rate, sb.snr_db, sb.round_trip_ms, b.cc_in.sessions_ok, a.cc_out.sessions,
                a.cc_in.sessions_ok, b.cc_out.sessions, b.pc_in.sessions_ok, pages);
@@ -358,9 +422,40 @@ int main(int argc, char **argv)
     fm_log_init(getenv("V34_DEBUG") ? FM_LOG_DEBUG : FM_LOG_WARN, false);
     if (argc > 1)
     {
-        int ok = run(atoi(argv[1]), argc > 2 ? atof(argv[2]) : 10.0, argc > 3 ? atof(argv[3]) : -60.0,
-                     argc > 4 ? atoi(argv[4]) : 33600, argc > 5 ? atoi(argv[5]) : 2, true);
+        int ok;
 
+        if (strcmp(argv[1], "soak") == 0)
+        {
+            /* Random lines: soak [runs] [first seed]. Each failure prints
+             * the arguments that repeat it. */
+            int runs = argc > 2 ? atoi(argv[2]) : 50;
+            unsigned seed = argc > 3 ? (unsigned) atoi(argv[3]) : 1;
+            int fails = 0;
+            static const int caps[] = { 33600, 33600, 33600, 28800, 24000, 14400, 9600 };
+
+            for (int i = 0; i < runs; i++, seed++)
+            {
+                uint32_t r = seed * 2654435761u;
+                int delay = (int) (r % 400);
+                double loss = (double) ((r >> 9) % 28);
+                double noise = -(double) (55 + (r >> 14) % 25);
+                double ppm = (double) ((int) ((r >> 19) % 201) - 100);
+                int cap = caps[(r >> 27) % 7];
+
+                if (!run(delay, loss, noise, cap, 2 + (int) (seed % 3), ppm, seed, false))
+                {
+                    fails++;
+                    printf("    repeat: v34hdxtest %d %.0f %.0f %d %d %.0f %u\n", delay, loss, noise, cap,
+                           2 + (int) (seed % 3), ppm, seed);
+                }
+            }
+            printf("soak: %d of %d failed\n", fails, runs);
+            fm_log_close();
+            return fails ? 1 : 0;
+        }
+        ok = run(atoi(argv[1]), argc > 2 ? atof(argv[2]) : 10.0, argc > 3 ? atof(argv[3]) : -60.0,
+                 argc > 4 ? atoi(argv[4]) : 33600, argc > 5 ? atoi(argv[5]) : 2, argc > 6 ? atof(argv[6]) : 0.0,
+                 argc > 7 ? (unsigned) atoi(argv[7]) : 12345, true);
         fm_log_close();
         return ok ? 0 : 1;
     }
@@ -370,13 +465,19 @@ int main(int argc, char **argv)
             int delay;
             double loss, noise;
             int cap;
-        } lines[] = { { 0, 0.0, -80.0, 33600 }, { 20, 10.0, -60.0, 33600 }, { 150, 20.0, -55.0, 33600 },
-                      { 300, 6.0, -50.0, 14400 } };
+            double ppm;
+            int pages;
+        } lines[] = { { 0, 0.0, -80.0, 33600, 0.0, 2 },      { 20, 10.0, -60.0, 33600, 0.0, 2 },
+                      { 150, 20.0, -55.0, 33600, 0.0, 2 },   { 300, 6.0, -50.0, 14400, 0.0, 2 },
+                      { 40, 12.0, -60.0, 33600, 80.0, 4 },   { 90, 8.0, -58.0, 33600, -100.0, 4 },
+                      { 10, 25.0, -58.0, 33600, 30.0, 3 },   { 60, 30.0, -60.0, 33600, -50.0, 3 },
+                      { 5, 6.0, -45.0, 33600, 0.0, 2 },      { 250, 15.0, -55.0, 9600, 60.0, 3 } };
         int fails = 0;
 
         printf("V.34 half duplex, modem to modem\n");
         for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]); i++)
-            if (!run(lines[i].delay, lines[i].loss, lines[i].noise, lines[i].cap, 2, true))
+            if (!run(lines[i].delay, lines[i].loss, lines[i].noise, lines[i].cap, lines[i].pages, lines[i].ppm,
+                     (unsigned) (i + 1), true))
                 fails++;
         printf(fails ? "%d FAILED\n" : "all passed\n", fails);
         fm_log_close();

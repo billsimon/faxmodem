@@ -17,6 +17,8 @@
 
 static int failures;
 
+#define PI_T 3.14159265358979323846
+
 #define CHECK(cond, ...)                                                                                   \
     do                                                                                                     \
     {                                                                                                      \
@@ -949,16 +951,27 @@ static int cc_once(bool far_answerer, int delay, double loss_db, double noise_db
         float x, e;
         int ev;
 
-        /* The far end's clock runs ppm fast: its samples arrive that much
-         * closer together. Linear interpolation is plenty at these rates. */
+        /* The far end's clock runs ppm fast. Windowed-sinc interpolation:
+         * a linear one takes up to 5 dB off a 2400 Hz carrier as the
+         * fractional delay drifts round, which the receiver then gets the
+         * blame for. */
         line[n & 8191] = v34_cctx_sample(&tx);
         pos += 1.0 / (1.0 + ppm * 1e-6);
         {
-            double at = (double) n - delay - (pos - (double) n);
+            double at = (double) n - delay - 64.0 - (pos - (double) n);
             long long i0 = (long long) floor(at);
-            float f = (float) (at - i0);
+            double f = at - (double) i0;
 
-            x = (i0 >= 1) ? line[i0 & 8191] * (1.0f - f) + line[(i0 + 1) & 8191] * f : 0.0f;
+            x = 0.0f;
+            if (i0 >= 16)
+                for (int k = -15; k <= 16; k++)
+                {
+                    double tt = (double) k - f;
+                    double sinc = (fabs(tt) < 1e-9) ? 1.0 : sin(PI_T * tt) / (PI_T * tt);
+                    double w = 0.42 + 0.5 * cos(PI_T * tt / 16.0) + 0.08 * cos(2.0 * PI_T * tt / 16.0);
+
+                    x += line[(i0 + k) & 8191] * (float) (sinc * w);
+                }
         }
         x = (float) (x * g + nrms * gauss());
         e = v34_cctx_sample(&ntx) * 0.3f;
