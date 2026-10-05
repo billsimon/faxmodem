@@ -192,6 +192,7 @@ static void result_write(const char *dir, const char *job_name, const fm_job_t *
     fprintf(f, "pages=%d\n", r->pages);
     fprintf(f, "bit-rate=%d\n", r->bit_rate);
     fprintf(f, "ecm=%s\n", r->ecm ? "yes" : "no");
+    fprintf(f, "v34=%s\n", r->v34 ? "yes" : "no");
     fprintf(f, "remote-id=%s\n", r->remote_ident);
     fprintf(f, "duration-ms=%d\n", r->duration_ms);
     fclose(f);

@@ -115,6 +115,7 @@ int main(int argc, char *argv[])
         printf("  V.17       %s\n", fm_fax_check_modems()
                                        ? "works (14400 available)"
                                        : "does not work in this spandsp build (fixed point); 9600 at most");
+        printf("  V.34       built in (--v34, Super G3 up to 33600)\n");
         return FM_EXIT_OK;
     }
     if (rc != FM_EXIT_OK)

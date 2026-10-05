@@ -402,6 +402,7 @@ static void call_fill_result(fm_call_t *c, fm_call_result_t *result)
     result->pages = c->inbound ? st.pages_rx : st.pages_tx;
     result->bit_rate = st.bit_rate;
     result->ecm = st.ecm;
+    result->v34 = st.v34;
     result->duration_ms = (int) (fm_now_ms() - c->started_ms);
     snprintf(result->remote_ident, sizeof(result->remote_ident), "%s", st.remote_ident);
 }
@@ -1275,9 +1276,10 @@ int fm_sip_send_fax(const fm_config_t *cfg, const char *to, const char *file, co
 
     fm_log_event(rc == FM_EXIT_OK ? FM_LOG_INFO : FM_LOG_ERROR, "send", "call finished",
                  "tag=%s to=\"%s\" sip_status=%d sip_reason=\"%s\" connected=%s result=\"%s\" pages=%d "
-                 "bit_rate=%d ecm=%s remote_id=\"%s\" duration_ms=%d exit=%d",
+                 "bit_rate=%d v34=%s ecm=%s remote_id=\"%s\" duration_ms=%d exit=%d",
                  tag, to, result->sip_status, result->sip_reason, result->connected ? "yes" : "no",
-                 result->t30_text, result->pages, result->bit_rate, result->ecm ? "yes" : "no",
+                 result->t30_text, result->pages, result->bit_rate, result->v34 ? "yes" : "no",
+                 result->ecm ? "yes" : "no",
                  result->remote_ident, result->duration_ms, rc);
 
     call_release(c);
@@ -1369,10 +1371,10 @@ void fm_sip_poll_inbound(void)
 reap:
     call_fill_result(c, &result);
     fm_log_event(result.t30_result == 0 ? FM_LOG_INFO : FM_LOG_ERROR, "receive", "fax received",
-                 "tag=%s file=\"%s\" result=\"%s\" pages=%d bit_rate=%d ecm=%s remote_id=\"%s\" "
+                 "tag=%s file=\"%s\" result=\"%s\" pages=%d bit_rate=%d v34=%s ecm=%s remote_id=\"%s\" "
                  "sip_status=%d duration_ms=%d",
                  c->tag, c->rx_file, result.t30_text, result.pages, result.bit_rate,
-                 result.ecm ? "yes" : "no", result.remote_ident, result.sip_status, result.duration_ms);
+                 result.v34 ? "yes" : "no", result.ecm ? "yes" : "no", result.remote_ident, result.sip_status, result.duration_ms);
 
     if (result.t30_result != 0 && fm_file_exists(c->rx_file))
         FM_WARN("receive", "%s may be incomplete", c->rx_file);
