@@ -100,12 +100,40 @@ faxmodem 0.1.0 (spandsp T.30 over SIP/G.711)
   spandsp    0.0.6
   pjproject  2.17
   libtiff    4.7.2
+  V.17       works (14400 available)
 ```
 
 Set `SOURCE_DATE_EPOCH` for a reproducible build stamp. A native build links
 dynamically against the spandsp, libtiff and OpenSSL on the build host, so it
 is not portable to a machine without them — for deployment, build the container
 image, which is self-contained apart from a handful of Debian runtime packages.
+
+### V.17 on Apple Silicon
+
+spandsp 0.0.6's `configure` builds it **fixed point** on any host it calls
+`arm`, and its old `config.guess` calls an Apple Silicon Mac
+`arm-apple-darwin`. Its fixed point V.17 modem does not work: it trains, then
+demodulates nothing but noise. So Homebrew's spandsp tops out at 9600 (V.29).
+faxmodem tries V.17 once at startup and, when it fails, stops offering it,
+warns, and says so in `faxmodem version`. Faxes still go through, just at 9600
+rather than 14400, which makes a page take about half as long again.
+
+Linux builds — the container, and Debian's `libspandsp2` on x86-64 or aarch64 —
+are floating point and unaffected. To get 14400 on a Mac, build a floating point
+spandsp beside Homebrew's and point CMake at it:
+
+```sh
+curl -fLO https://deb.debian.org/debian/pool/main/s/spandsp/spandsp_0.0.6+dfsg.orig.tar.xz
+tar xf spandsp_0.0.6+dfsg.orig.tar.xz && cd spandsp-0.0.6+dfsg
+TIFF=$(brew --prefix libtiff)
+./configure --prefix="$HOME/.local/spandsp" CPPFLAGS="-I$TIFF/include" LDFLAGS="-L$TIFF/lib" \
+    "ac_cv_fixed_point_machine_$(sh config/config.guess | tr -c 'a-zA-Z0-9\n' _)=no"
+grep -q '#undef SPANDSP_USE_FIXED_POINT' src/spandsp.h && echo "floating point: good"
+make -C src && make -C src install
+mkdir -p "$HOME/.local/spandsp/lib/pkgconfig" && cp spandsp.pc "$HOME/.local/spandsp/lib/pkgconfig/"
+cd - && PKG_CONFIG_PATH="$HOME/.local/spandsp/lib/pkgconfig" cmake -S . -B build && cmake --build build
+./build/faxmodem version    # V.17       works (14400 available)
+```
 
 ## Quick start
 
@@ -151,6 +179,12 @@ same name everywhere: the flag `--station-id` is `FAXMODEM_STATION_ID` in the
 environment and `station-id = ...` in a config file. `faxmodem help` lists them
 all; see [`examples/faxmodem.conf`](examples/faxmodem.conf).
 
+In a config file a `#` after whitespace starts a trailing comment
+(`media-timeout = 20  # seconds`); a `#` with no space before it, as in a
+password like `abc#123`, is part of the value. A value that must contain ` #`
+belongs in the environment or on the command line instead. Spool job files take
+every value verbatim, so a `header` like `Acme #42` survives the queue.
+
 The settings that matter most in practice:
 
 | Flag | Default | Notes |
@@ -178,6 +212,13 @@ The settings that matter most in practice:
 `--log-level debug` also turns up pjsip (full SIP message traces) and spandsp
 (T.30 frame-by-frame) logging; `--pjsip-log-level` and `--spandsp-log-level`
 override each independently.
+
+Most T.30 logging happens on the media thread, in the middle of a 20 ms audio
+frame, so lines from pjsip's and pjmedia's threads are queued and written by a
+logger thread rather than in place: a stdout that stops accepting writes (a log
+driver falling behind, a `| jq` that stopped reading) cannot stall the fax
+carrier. If the 1 MB queue fills, lines are dropped and a
+`N log lines dropped: stdout could not keep up` warning says how many.
 
 ### Registration
 
@@ -320,6 +361,16 @@ gs -q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=tiffg4 -r204x196 -g1728x2156 \
 fraction of a second — it proves spandsp, your TIFF and the build, and never
 touches the network.
 
+`FAXMODEM_SELFTEST_LINE` puts a worse line between the two engines, for what a
+perfect one cannot exercise: `delay=150` (ms, each way), `echo=-20` (each
+end's own signal returned that many dB down, a round trip later, as a far-end
+hybrid does), `noise=-50` (white noise, dBm0), and `ulaw` or `alaw` (G.711).
+It is a test hook, not an option:
+
+```sh
+FAXMODEM_SELFTEST_LINE="delay=150,echo=-20,ulaw" faxmodem selftest invoice.tif --output-dir /tmp/out
+```
+
 `scripts/loopback-test.sh` goes further: it starts a receiver on 127.0.0.1,
 sends it a fax from a second process over real SIP and real RTP, and compares
 page counts. That exercises everything except your carrier.
@@ -362,11 +413,27 @@ address in the SDP must be the public one, so set `--public-addr` or `--stun`.
 The watchdog clears the channel rather than holding it for the full `--timeout`,
 so a redialling sender gets answered instead of a busy signal.
 
+**Every call runs at 9600, never 14400.** Check `faxmodem version`: if V.17
+"does not work in this spandsp build", see [V.17 on Apple Silicon](#v17-on-apple-silicon).
+
 **Training keeps retraining down.** Try `--max-speed 9600`, then `4800`. Packet
 loss, transcoding and one-way jitter all look like a bad phone line to a modem.
 
 **Pages arrive corrupted.** Keep ECM on; with ECM off any lost packet becomes
 speckle. `bad_rows` in the per-page log line tells you how bad the line is.
+
+**A very noisy line never gets going.** spandsp's receivers treat anything
+above -45.5 dBm0 as a carrier, so line noise near that level (it takes an
+unusually bad analog leg; VoIP paths sit far below it) looks like a carrier
+that never drops, and T.30 waits for the end of a frame that never comes.
+Transfers become unreliable from about -50 dBm0 of noise and stop entirely at
+-45. `--advance-timeout` clears such a call; there is no setting that rescues
+it.
+
+**Long-delay calls and echo.** On a call into the telephone network the far
+end's line card can return our own signal a round trip later. faxmodem ignores
+a received frame identical to one it sent in the last few seconds, so this no
+longer ends calls; `own_echoes=` in the `transfer finished` line counts them.
 
 **Nothing in the inbox.** `receive` writes only when a call actually completes
 T.30; a partial transfer is logged as such and the TIFF flagged as incomplete.
@@ -387,7 +454,7 @@ T.30; a partial transfer is logged as such and the TIFF flagged as incomplete.
 ```
 src/main.c        command dispatch, signals
 src/config.c      flags, environment, config files (one option table drives all three)
-src/log.c         stdout logging; pjsip and spandsp are routed through it
+src/log.c         stdout logging, queued off the media thread; pjsip and spandsp are routed through it
 src/fax.c         spandsp T.30 engine, phase B/D/E handlers, in-memory selftest
 src/sip.c         pjsua setup, registration, calls, and the fax pjmedia port
 src/spool.c       the queue: claim, send, retry, result files

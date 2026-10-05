@@ -16,6 +16,11 @@ typedef enum
 /* Initialise the logger. Safe to call more than once. */
 void fm_log_init(fm_log_level_t level, bool json);
 
+/* Stops the logger thread and writes out anything still queued. Lines from
+ * pjsip's and pjmedia's threads are queued rather than written in place, so
+ * that a slow stdout cannot stall the fax carrier; see log.c. */
+void fm_log_close(void);
+
 /* Parse "error"/"warn"/"info"/"debug"/"trace". Returns false on a bad name. */
 bool fm_log_level_parse(const char *name, fm_log_level_t *out);
 const char *fm_log_level_name(fm_log_level_t level);

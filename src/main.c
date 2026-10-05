@@ -112,6 +112,9 @@ int main(int argc, char *argv[])
         printf("  spandsp    %s\n", FAXMODEM_SPANDSP_VERSION);
         printf("  pjproject  %s\n", FAXMODEM_PJPROJECT_VERSION);
         printf("  libtiff    %s\n", FAXMODEM_TIFF_VERSION);
+        printf("  V.17       %s\n", fm_fax_check_modems()
+                                       ? "works (14400 available)"
+                                       : "does not work in this spandsp build (fixed point); 9600 at most");
         return FM_EXIT_OK;
     }
     if (rc != FM_EXIT_OK)
@@ -126,6 +129,16 @@ int main(int argc, char *argv[])
 
     install_signal_handlers();
     fm_fax_init_logging(&cfg);
+
+    /* Before any SIP thread exists: inbound calls create engines there. */
+    if (!fm_fax_check_modems() && cfg.max_speed > 9600 &&
+        (cfg.command == FM_CMD_SEND || cfg.command == FM_CMD_RECEIVE || cfg.command == FM_CMD_DAEMON ||
+         cfg.command == FM_CMD_SELFTEST))
+    {
+        FM_WARN("fax", "this spandsp's V.17 modem does not work - it is a fixed point build, which spandsp 0.0.6 "
+                       "makes on Apple Silicon - so V.17 is not offered and faxes run at 9600 at most; see "
+                       "'V.17 on Apple Silicon' in the README");
+    }
 
     if (cfg.station_id[0] == '\0' &&
         (cfg.command == FM_CMD_SEND || cfg.command == FM_CMD_RECEIVE || cfg.command == FM_CMD_DAEMON))
@@ -167,5 +180,6 @@ int main(int argc, char *argv[])
     }
 
     FM_INFO("faxmodem", "exit %d", rc);
+    fm_log_close();
     return rc;
 }
