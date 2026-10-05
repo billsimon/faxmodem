@@ -114,7 +114,7 @@ int main(int argc, char *argv[])
         printf("  libtiff    %s\n", FAXMODEM_TIFF_VERSION);
         printf("  V.17       %s\n", fm_fax_check_modems()
                                        ? "works (14400 available)"
-                                       : "does not work in this spandsp build (fixed point); 9600 at most");
+                                       : "failed its startup check; 9600 at most");
         printf("  V.34       built in (--v34, Super G3 up to 33600)\n");
         return FM_EXIT_OK;
     }
@@ -136,9 +136,8 @@ int main(int argc, char *argv[])
         (cfg.command == FM_CMD_SEND || cfg.command == FM_CMD_RECEIVE || cfg.command == FM_CMD_DAEMON ||
          cfg.command == FM_CMD_SELFTEST))
     {
-        FM_WARN("fax", "this spandsp's V.17 modem does not work - it is a fixed point build, which spandsp 0.0.6 "
-                       "makes on Apple Silicon - so V.17 is not offered and faxes run at 9600 at most; see "
-                       "'V.17 on Apple Silicon' in the README");
+        FM_WARN("fax", "spandsp's V.17 modem failed its startup check, so V.17 is not offered and faxes run at "
+                       "9600 at most; see 'V.17 and fixed point spandsp' in the README");
     }
 
     if (cfg.station_id[0] == '\0' &&

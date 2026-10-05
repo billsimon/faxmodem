@@ -67,10 +67,11 @@ add_executable(faxmodem
 target_include_directories(faxmodem PRIVATE include "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 # spandsp's T.30 engine and fax front end, vendored from 0.0.6 and patched for
-# V.34 (T.30 Annex F); they override the installed library's copies. See
-# third_party/spandsp-t30/README.md.
-set(T30_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/spandsp-t30")
-set(T30_SOURCES "${T30_DIR}/t30.c" "${T30_DIR}/t30_api.c" "${T30_DIR}/t30_logging.c" "${T30_DIR}/fax.c")
+# V.34 (T.30 Annex F), and its V.17 receiver, fixed for fixed point builds;
+# they override the installed library's copies. See third_party/spandsp/README.md.
+set(T30_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/spandsp")
+set(T30_SOURCES "${T30_DIR}/t30.c" "${T30_DIR}/t30_api.c" "${T30_DIR}/t30_logging.c" "${T30_DIR}/fax.c"
+    "${T30_DIR}/v17rx.c")
 target_sources(faxmodem PRIVATE ${T30_SOURCES})
 # They include spandsp's headers one by one, never <spandsp.h>, which is the
 # only place the installed library says whether it was built fixed point - and
@@ -88,8 +89,10 @@ if(_spandsp_fixed)
 else()
   message(STATUS "spandsp: floating point build")
 endif()
+# -fwrapv: spandsp does phase arithmetic in int32_t and relies on it wrapping,
+# which C leaves undefined; clang at -O2 then broke V.17's short training.
 set_source_files_properties(${T30_SOURCES} PROPERTIES
-    COMPILE_OPTIONS "-w"
+    COMPILE_OPTIONS "-w;-fwrapv"
     INCLUDE_DIRECTORIES "${T30_DIR}"
     COMPILE_DEFINITIONS "${T30_DEFS}")
 target_link_libraries(faxmodem PRIVATE

@@ -76,8 +76,8 @@ int fm_fax_exit_code(int t30_result);
 void fm_fax_init_logging(const fm_config_t *cfg);
 
 /* Tries spandsp's V.17 modem back to back, once, and stops offering it if it
- * does not work - as in a fixed point spandsp 0.0.6, which is what Homebrew
- * builds on Apple Silicon. Call it from the main thread before any engine is
+ * does not work - as the receiver in a fixed point spandsp 0.0.6 did before
+ * third_party/spandsp/v17rx.c replaced it. Call it from the main thread before any engine is
  * created; later calls return the first answer. */
 bool fm_fax_check_modems(void);
 

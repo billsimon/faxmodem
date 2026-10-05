@@ -101,6 +101,7 @@ faxmodem 0.1.0 (spandsp T.30 over SIP/G.711)
   pjproject  2.17
   libtiff    4.7.2
   V.17       works (14400 available)
+  V.34       built in (--v34, Super G3 up to 33600)
 ```
 
 Set `SOURCE_DATE_EPOCH` for a reproducible build stamp. A native build links
@@ -108,32 +109,33 @@ dynamically against the spandsp, libtiff and OpenSSL on the build host, so it
 is not portable to a machine without them — for deployment, build the container
 image, which is self-contained apart from a handful of Debian runtime packages.
 
-### V.17 on Apple Silicon
+### V.17 and fixed point spandsp
 
 spandsp 0.0.6's `configure` builds it **fixed point** on any host it calls
 `arm`, and its old `config.guess` calls an Apple Silicon Mac
-`arm-apple-darwin`. Its fixed point V.17 modem does not work: it trains, then
-demodulates nothing but noise. So Homebrew's spandsp tops out at 9600 (V.29).
-faxmodem tries V.17 once at startup and, when it fails, stops offering it,
-warns, and says so in `faxmodem version`. Faxes still go through, just at 9600
-rather than 14400, which makes a page take about half as long again.
+`arm-apple-darwin`, so that is what Homebrew installs there. The fixed point
+build's V.17 receiver is broken: a few `#if`s in `v17rx.c` test
+`SPANDSP_USE_FIXED_POINT` where the rest of the file, and its state structure,
+test a deliberately disabled `SPANDSP_USE_FIXED_POINTx`, so its input filter
+runs integer arithmetic over floating point data. It trains, then demodulates
+nothing but noise, and on its own that library tops out at 9600 (V.29).
+Separately, in every build, the receiver's short training (used for each
+page after the first training) relies on signed integer overflow, which
+clang at `-O2` may compile into the wrong answer. On some lines that fails
+every page.
 
-Linux builds — the container, and Debian's `libspandsp2` on x86-64 or aarch64 —
-are floating point and unaffected. To get 14400 on a Mac, build a floating point
-spandsp beside Homebrew's and point CMake at it:
+faxmodem compiles a corrected `v17rx.c` (`third_party/spandsp/`, whose
+README has the details) that overrides the library's, so it runs V.17 at
+14400 against any spandsp 0.0.6, fixed or floating point. Where the stock
+floating point receiver works, the corrected one decodes exactly what it
+decodes, bit for bit, noise and all; the fixed point transmitter was never
+affected. Linux builds - the container, and Debian's `libspandsp2` on
+x86-64 or aarch64 - are floating point, so there only the overflow fix
+matters.
 
-```sh
-curl -fLO https://deb.debian.org/debian/pool/main/s/spandsp/spandsp_0.0.6+dfsg.orig.tar.xz
-tar xf spandsp_0.0.6+dfsg.orig.tar.xz && cd spandsp-0.0.6+dfsg
-TIFF=$(brew --prefix libtiff)
-./configure --prefix="$HOME/.local/spandsp" CPPFLAGS="-I$TIFF/include" LDFLAGS="-L$TIFF/lib" \
-    "ac_cv_fixed_point_machine_$(sh config/config.guess | tr -c 'a-zA-Z0-9\n' _)=no"
-grep -q '#undef SPANDSP_USE_FIXED_POINT' src/spandsp.h && echo "floating point: good"
-make -C src && make -C src install
-mkdir -p "$HOME/.local/spandsp/lib/pkgconfig" && cp spandsp.pc "$HOME/.local/spandsp/lib/pkgconfig/"
-cd - && PKG_CONFIG_PATH="$HOME/.local/spandsp/lib/pkgconfig" cmake -S . -B build && cmake --build build
-./build/faxmodem version    # V.17       works (14400 available)
-```
+faxmodem still tries V.17 once at startup and, should it ever fail, stops
+offering it, warns, and says so in `faxmodem version`, so that a broken modem
+costs speed rather than calls.
 
 ## Quick start
 
@@ -319,10 +321,9 @@ It is off by default. With it on:
   primary channel at the rate line probing and training picked, capped by
   `--v34-max-rate`. `--max-speed` only matters when the call falls back to G3.
 
-The V.34 modem is faxmodem's own (`src/v34hdx.c`, `src/v34_*.c`), so unlike
-V.17 it is unaffected by a fixed point spandsp and gives 33600 on Apple Silicon
-too. T.30 is spandsp's, with the Annex F changes, vendored in
-`third_party/spandsp-t30/` (its README lists them); it overrides the
+The V.34 modem is faxmodem's own (`src/v34hdx.c`, `src/v34_*.c`), not
+spandsp's, and floating point whatever spandsp was built as. T.30 is spandsp's, with the Annex F changes, vendored in
+`third_party/spandsp/` (its README lists them); it overrides the
 installed library's copy, which must be spandsp 0.0.6.
 
 The log says which way a call went. `v34=yes` and the page rate appear in the
@@ -490,7 +491,8 @@ The watchdog clears the channel rather than holding it for the full `--timeout`,
 so a redialling sender gets answered instead of a busy signal.
 
 **Every call runs at 9600, never 14400.** Check `faxmodem version`: if V.17
-"does not work in this spandsp build", see [V.17 on Apple Silicon](#v17-on-apple-silicon).
+"failed its startup check", see [V.17 and fixed point spandsp](#v17-and-fixed-point-spandsp).
+Otherwise it is the line or the far machine; see the next item.
 
 **Training keeps retraining down.** Try `--max-speed 9600`, then `4800`. Packet
 loss, transcoding and one-way jitter all look like a bad phone line to a modem.
@@ -537,7 +539,7 @@ src/fax.c         spandsp T.30 engine, phase B/D/E handlers, in-memory selftest
 src/v34hdx.c      half duplex V.34 modem: V.8, start-up, control and primary channels
 src/v34_cc.c      V.34's control channel modem
 src/v34_*.c       V.34 coding, DSP and INFO/MP messages
-third_party/spandsp-t30/  spandsp's T.30 and fax front end with T.30 Annex F
+third_party/spandsp/  spandsp's T.30 and fax front end with T.30 Annex F
 src/sip.c         pjsua setup, registration, calls, and the fax pjmedia port
 src/spool.c       the queue: claim, send, retry, result files
 src/tiff_probe.c  pre-flight document checks
