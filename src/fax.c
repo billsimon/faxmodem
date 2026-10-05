@@ -77,9 +77,87 @@ static void attach_logging(logging_state_t *lg, const char *tag)
         span_log_set_tag(lg, tag);
 }
 
+/* spandsp 0.0.6 builds itself fixed point on any host its configure script
+ * calls "arm" - which, through an old config.guess, includes Apple Silicon
+ * Macs - and its fixed point V.17 does not work: it trains, then demodulates
+ * nothing but noise, at every rate. T.30 copes - TCF fails at 14400 and 12000
+ * and the call settles at 9600 - but every call spends two failed trainings
+ * getting there, and as a receiver we would advertise a modem we cannot
+ * receive. So V.17 is tried once, back to back, before it is offered. A
+ * floating point spandsp passes; so would a fixed point one that had been
+ * fixed. -1 until fm_fax_check_modems() has run. */
+static int g_v17_ok = -1;
+
+typedef struct
+{
+    long run;
+    long longest;
+} v17_probe_t;
+
+static int v17_probe_get_bit(void *user_data)
+{
+    (void) user_data;
+    return 0; /* all zeros, as in TCF */
+}
+
+static void v17_probe_put_bit(void *user_data, int bit)
+{
+    v17_probe_t *p = user_data;
+
+    if (bit < 0)
+        return; /* a status change, not data */
+    if (bit == 0)
+    {
+        if (++p->run > p->longest)
+            p->longest = p->run;
+    }
+    else
+    {
+        p->run = 0;
+    }
+}
+
+bool fm_fax_check_modems(void)
+{
+    v17_probe_t probe = {0, 0};
+    v17_tx_state_t *tx;
+    v17_rx_state_t *rx;
+    int16_t buf[SELFTEST_CHUNK];
+
+    if (g_v17_ok >= 0)
+        return g_v17_ok == 1;
+
+    tx = v17_tx_init(NULL, 14400, FALSE, v17_probe_get_bit, NULL);
+    rx = v17_rx_init(NULL, 14400, v17_probe_put_bit, &probe);
+    if (tx == NULL || rx == NULL)
+    {
+        g_v17_ok = 0;
+    }
+    else
+    {
+        /* Three seconds: the long training takes about one and a half. */
+        for (int i = 0; i < 3 * 8000 / SELFTEST_CHUNK; i++)
+        {
+            int n = v17_tx(tx, buf, SELFTEST_CHUNK);
+
+            if (n < SELFTEST_CHUNK)
+                memset(buf + n, 0, (size_t) (SELFTEST_CHUNK - n) * sizeof(int16_t));
+            v17_rx(rx, buf, SELFTEST_CHUNK);
+        }
+        /* A working modem delivers over a second of unbroken zeros; the
+         * broken one never more than a handful. */
+        g_v17_ok = probe.longest >= 8000 ? 1 : 0;
+    }
+    if (tx != NULL)
+        v17_tx_free(tx);
+    if (rx != NULL)
+        v17_rx_free(rx);
+    return g_v17_ok == 1;
+}
+
 static int modems_for_speed(int max_speed)
 {
-    if (max_speed >= 14400)
+    if (max_speed >= 14400 && g_v17_ok != 0)
         return T30_SUPPORT_V27TER | T30_SUPPORT_V29 | T30_SUPPORT_V17;
     if (max_speed >= 7200)
         return T30_SUPPORT_V27TER | T30_SUPPORT_V29;

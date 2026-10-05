@@ -100,12 +100,40 @@ faxmodem 0.1.0 (spandsp T.30 over SIP/G.711)
   spandsp    0.0.6
   pjproject  2.17
   libtiff    4.7.2
+  V.17       works (14400 available)
 ```
 
 Set `SOURCE_DATE_EPOCH` for a reproducible build stamp. A native build links
 dynamically against the spandsp, libtiff and OpenSSL on the build host, so it
 is not portable to a machine without them — for deployment, build the container
 image, which is self-contained apart from a handful of Debian runtime packages.
+
+### V.17 on Apple Silicon
+
+spandsp 0.0.6's `configure` builds it **fixed point** on any host it calls
+`arm`, and its old `config.guess` calls an Apple Silicon Mac
+`arm-apple-darwin`. Its fixed point V.17 modem does not work: it trains, then
+demodulates nothing but noise. So Homebrew's spandsp tops out at 9600 (V.29).
+faxmodem tries V.17 once at startup and, when it fails, stops offering it,
+warns, and says so in `faxmodem version`. Faxes still go through, just at 9600
+rather than 14400, which makes a page take about half as long again.
+
+Linux builds — the container, and Debian's `libspandsp2` on x86-64 or aarch64 —
+are floating point and unaffected. To get 14400 on a Mac, build a floating point
+spandsp beside Homebrew's and point CMake at it:
+
+```sh
+curl -fLO https://deb.debian.org/debian/pool/main/s/spandsp/spandsp_0.0.6+dfsg.orig.tar.xz
+tar xf spandsp_0.0.6+dfsg.orig.tar.xz && cd spandsp-0.0.6+dfsg
+TIFF=$(brew --prefix libtiff)
+./configure --prefix="$HOME/.local/spandsp" CPPFLAGS="-I$TIFF/include" LDFLAGS="-L$TIFF/lib" \
+    "ac_cv_fixed_point_machine_$(sh config/config.guess | tr -c 'a-zA-Z0-9\n' _)=no"
+grep -q '#undef SPANDSP_USE_FIXED_POINT' src/spandsp.h && echo "floating point: good"
+make -C src && make -C src install
+mkdir -p "$HOME/.local/spandsp/lib/pkgconfig" && cp spandsp.pc "$HOME/.local/spandsp/lib/pkgconfig/"
+cd - && PKG_CONFIG_PATH="$HOME/.local/spandsp/lib/pkgconfig" cmake -S . -B build && cmake --build build
+./build/faxmodem version    # V.17       works (14400 available)
+```
 
 ## Quick start
 
@@ -384,6 +412,9 @@ permits a narrower range than the one media is negotiating: pin it with
 address in the SDP must be the public one, so set `--public-addr` or `--stun`.
 The watchdog clears the channel rather than holding it for the full `--timeout`,
 so a redialling sender gets answered instead of a busy signal.
+
+**Every call runs at 9600, never 14400.** Check `faxmodem version`: if V.17
+"does not work in this spandsp build", see [V.17 on Apple Silicon](#v17-on-apple-silicon).
 
 **Training keeps retraining down.** Try `--max-speed 9600`, then `4800`. Packet
 loss, transcoding and one-way jitter all look like a bad phone line to a modem.

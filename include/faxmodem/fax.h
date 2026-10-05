@@ -72,6 +72,12 @@ int fm_fax_exit_code(int t30_result);
  * cfg->log_level (or cfg->spandsp_log_level when set). Call once at startup. */
 void fm_fax_init_logging(const fm_config_t *cfg);
 
+/* Tries spandsp's V.17 modem back to back, once, and stops offering it if it
+ * does not work - as in a fixed point spandsp 0.0.6, which is what Homebrew
+ * builds on Apple Silicon. Call it from the main thread before any engine is
+ * created; later calls return the first answer. */
+bool fm_fax_check_modems(void);
+
 /* Runs two engines back to back in memory: no SIP, no audio device. Returns a
  * process exit code. */
 int fm_fax_selftest(const fm_config_t *cfg);
