@@ -11,9 +11,15 @@
 #include <string.h>
 #include <time.h>
 
+/* For the echo guard, which has to reach the HDLC receiver inside fax_state_t;
+ * see echo_guard_hook(). */
+#define SPANDSP_EXPOSE_INTERNAL_STRUCTURES
 #include <spandsp.h>
 
 #define SELFTEST_CHUNK 160                 /* 20 ms at 8 kHz */
+#define ECHO_FRAMES 4                      /* our last few control frames */
+#define ECHO_FRAME_MAX 64                  /* longer is never a control frame we would see again */
+#define ECHO_WINDOW_SAMPLES (5 * 8000)     /* a 2.5 s round trip, plus the frame's own preamble */
 #define SELFTEST_MAX_SECONDS (30 * 60)
 
 struct fm_fax
@@ -30,6 +36,20 @@ struct fm_fax
     int seen_image_size;
     /* Refreshed from the spandsp callbacks, which already run under lock. */
     fm_fax_status_t status;
+    /* The echo guard: what we sent lately, by the audio clock, which counts
+     * samples received - so it runs at the selftest's speed as well as a
+     * call's. */
+    int64_t samples;
+    struct
+    {
+        uint8_t msg[ECHO_FRAME_MAX];
+        int len;
+        int64_t at;
+    } sent[ECHO_FRAMES];
+    int sent_next;
+    int echoes;
+    t30_set_handler_t *set_rx_type;
+    void *set_rx_type_user_data;
 };
 
 static int g_spandsp_level = SPAN_LOG_WARNING;
@@ -218,9 +238,9 @@ static void phase_e_handler(t30_state_t *t30, void *user_data, int completion_co
 
     fm_log_event(completion_code == T30_ERR_OK ? FM_LOG_INFO : FM_LOG_ERROR, "fax", "transfer finished",
                  "tag=%s result=%d result_text=\"%s\" pages_tx=%d pages_rx=%d bit_rate=%d ecm=%s "
-                 "remote_id=\"%s\"",
+                 "remote_id=\"%s\" own_echoes=%d",
                  s->tag, completion_code, s->status.result_text, s->status.pages_tx, s->status.pages_rx,
-                 s->status.bit_rate, s->status.ecm ? "yes" : "no", s->status.remote_ident);
+                 s->status.bit_rate, s->status.ecm ? "yes" : "no", s->status.remote_ident, s->echoes);
 }
 
 /* Only frames arriving from the far end count. Page completions alone are too
@@ -234,10 +254,90 @@ static void real_time_frame_handler(t30_state_t *t30, void *user_data, int direc
     struct fm_fax *s = user_data;
 
     (void) t30;
-    (void) msg;
-    (void) len;
     if (direction)
+    {
         s->last_rx_frame_ms = fm_now_ms();
+        return;
+    }
+    /* Ours, on its way out: remembered for the echo guard. ECM image frames
+     * go out on the fast modem and would only push the control frames out. */
+    if (len < 3 || len > ECHO_FRAME_MAX || msg[2] == T4_FCD || msg[2] == T4_RCP)
+        return;
+    memcpy(s->sent[s->sent_next].msg, msg, (size_t) len);
+    s->sent[s->sent_next].len = len;
+    s->sent[s->sent_next].at = s->samples;
+    s->sent_next = (s->sent_next + 1) % ECHO_FRAMES;
+}
+
+/* The echo guard. On a call into the telephone network the far end's line
+ * card returns our own signal a round trip later, and network echo
+ * cancellers do not always take it out. When the round trip is long - from
+ * about 600 ms - the tail of our own V.21 frame arrives after we have stopped
+ * sending and are listening again, and spandsp 0.0.6 takes it for the far
+ * end's: a receiver that hears its own CFR echo gives up with "Unexpected
+ * command after page received", a sender that hears its own PPS with
+ * "Invalid ECM response". So a frame received intact that is byte for byte
+ * one we sent in the last few seconds is dropped before T.30 sees it. The
+ * far end does not send our frames: T.30 marks each with the X bit of the
+ * station that sent it. */
+static bool is_own_echo(const struct fm_fax *s, const uint8_t *msg, int len)
+{
+    for (int i = 0; i < ECHO_FRAMES; i++)
+    {
+        if (s->sent[i].len == len && s->samples - s->sent[i].at <= ECHO_WINDOW_SAMPLES &&
+            memcmp(s->sent[i].msg, msg, (size_t) len) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Called from inside fax_rx(), i.e. already under s->lock. len < 0 is a
+ * status report, not a frame; a damaged frame (ok false) goes through, as
+ * T.30 counts those. */
+static void echo_guard_hdlc_accept(void *user_data, const uint8_t *msg, int len, int ok)
+{
+    struct fm_fax *s = user_data;
+
+    if (len > 0 && ok && is_own_echo(s, msg, len))
+    {
+        s->echoes++;
+        FM_DEBUG("fax", "tag=%s ignored an echo of our own %s", s->tag, t30_frametype(msg[2]));
+        return;
+    }
+    t30_hdlc_accept(fax_get_t30_state(s->fax), msg, len, ok);
+}
+
+/* spandsp re-initialises its HDLC receiver, with t30_hdlc_accept wired in,
+ * each time T.30 changes receive mode - so the guard is put back each time,
+ * right after. */
+static void echo_guard_hook(struct fm_fax *s)
+{
+    hdlc_rx_state_t *rx = &s->fax->modems.hdlc_rx;
+
+    if (rx->frame_handler == t30_hdlc_accept)
+    {
+        rx->frame_handler = echo_guard_hdlc_accept;
+        rx->frame_user_data = s;
+    }
+}
+
+static void echo_guard_set_rx_type(void *user_data, int type, int bit_rate, int short_train, int use_hdlc)
+{
+    struct fm_fax *s = user_data;
+
+    s->set_rx_type(s->set_rx_type_user_data, type, bit_rate, short_train, use_hdlc);
+    echo_guard_hook(s);
+}
+
+static void echo_guard_install(struct fm_fax *s)
+{
+    t30_state_t *t30 = fax_get_t30_state(s->fax);
+
+    s->set_rx_type = t30->set_rx_type_handler;
+    s->set_rx_type_user_data = t30->set_rx_type_user_data;
+    t30->set_rx_type_handler = echo_guard_set_rx_type;
+    t30->set_rx_type_user_data = s;
+    echo_guard_hook(s);
 }
 
 static void configure_t30(struct fm_fax *s, const fm_fax_params_t *p)
@@ -309,6 +409,7 @@ fm_fax_t *fm_fax_create(const fm_fax_params_t *params)
     fax_set_transmit_on_idle(s->fax, TRUE);
     attach_logging(fax_get_logging_state(s->fax), s->tag);
     configure_t30(s, params);
+    echo_guard_install(s);
 
     fm_log_event(FM_LOG_INFO, "fax", "engine started",
                  "tag=%s role=%s ecm=%s max_speed=%d station_id=\"%s\" tx_file=\"%s\" rx_file=\"%s\"", s->tag,
@@ -343,6 +444,7 @@ void fm_fax_rx(fm_fax_t *fax, const int16_t *samples, int count)
     if (s == NULL || count <= 0)
         return;
     pthread_mutex_lock(&s->lock);
+    s->samples += count;
     if (s->fax != NULL)
         fax_rx(s->fax, (int16_t *) samples, count);
     pthread_mutex_unlock(&s->lock);
@@ -355,6 +457,7 @@ void fm_fax_rx_missing(fm_fax_t *fax, int count)
     if (s == NULL || count <= 0)
         return;
     pthread_mutex_lock(&s->lock);
+    s->samples += count;
     if (s->fax != NULL)
         fax_rx_fillin(s->fax, count);
     pthread_mutex_unlock(&s->lock);
