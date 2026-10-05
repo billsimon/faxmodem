@@ -262,6 +262,114 @@ bool v34_mp_unpack(const uint8_t *bits, int n, v34_mp_t *o)
     return true;
 }
 
+/* Table 22 */
+int v34_infoh_pack(const v34_infoh_t *in, uint8_t *bits)
+{
+    int p = put_info_head(bits);
+
+    p = put(bits, p, (unsigned) in->power_reduction, 3);
+    p = put(bits, p, (unsigned) in->trn_len, 7);
+    p = put(bits, p, in->high, 1);
+    p = put(bits, p, (unsigned) in->pre_emphasis, 4);
+    p = put(bits, p, (unsigned) in->sr, 3);
+    p = put(bits, p, in->trn16, 1);
+    p = put_crc(bits, 12, p);
+    return put(bits, p, 0xF, 4);
+}
+
+bool v34_infoh_unpack(const uint8_t *bits, int n, v34_infoh_t *o)
+{
+    if (n < V34_INFOH_BITS - 4 || !info_crc_ok(bits, 12, 31))
+        return false;
+    memset(o, 0, sizeof(*o));
+    o->power_reduction = (int) get(bits, 12, 3);
+    o->trn_len = (int) get(bits, 15, 7);
+    o->high = bits[22];
+    o->pre_emphasis = (int) get(bits, 23, 4);
+    o->sr = (int) get(bits, 27, 3);
+    o->trn16 = bits[30];
+    return o->sr < V34_NUM_SR && o->pre_emphasis <= 10;
+}
+
+/* Tables 23 and 24: framed exactly as MP is, fields of sixteen after a zero
+ * start bit, the CRC over the fields alone. */
+int v34_mph_pack(const v34_mph_t *in, uint8_t *bits)
+{
+    int fields = (in->type == 1) ? 9 : 3;
+    uint16_t crc = 0xFFFF;
+    int p = 0;
+
+    p = put(bits, p, 0x1FFFF, 17);
+    /* 17:33 */
+    p = put(bits, p, 0, 1);
+    p = put(bits, p, (unsigned) in->type, 1);
+    p = put(bits, p, 0, 1);
+    p = put(bits, p, (unsigned) in->max_rate, 4);
+    p = put(bits, p, 0, 3);
+    p = put(bits, p, in->cc2400, 1);
+    p = put(bits, p, 0, 1);
+    p = put(bits, p, (unsigned) in->trellis, 2);
+    p = put(bits, p, in->nonlinear, 1);
+    p = put(bits, p, in->expanded, 1);
+    p = put(bits, p, 0, 1);
+    /* 34:50 */
+    p = put(bits, p, 0, 1);
+    p = put(bits, p, in->rate_mask & 0x3FFFu, 15);
+    p = put(bits, p, in->asymmetric_cc, 1);
+    /* 51:67, and in type 1 the six coefficients and a reserved field */
+    for (int f = 2; f < fields; f++)
+    {
+        unsigned v = 0;
+
+        if (in->type == 1 && f < 8)
+            v = (uint16_t) in->h[(f - 2) / 2][(f - 2) % 2];
+        p = put(bits, p, 0, 1);
+        p = put(bits, p, v, 16);
+    }
+    for (int f = 0; f < fields; f++)
+        crc = v34_crc_bits(bits + 18 + 17 * f, 16, crc);
+    p = put(bits, p, 0, 1);
+    p = put(bits, p, crc, 16);
+    return put(bits, p, 0, (in->type == 1) ? 1 : 3);
+}
+
+bool v34_mph_unpack(const uint8_t *bits, int n, v34_mph_t *o)
+{
+    int type;
+    int fields;
+    uint16_t crc = 0xFFFF;
+
+    if (n < V34_MPH0_BITS - 3)
+        return false;
+    for (int i = 0; i < 17; i++)
+        if (!bits[i])
+            return false;
+    type = bits[18];
+    fields = type ? 9 : 3;
+    if (type && n < V34_MPH1_BITS - 1)
+        return false;
+    for (int f = 0; f <= fields; f++)
+        if (bits[17 + 17 * f])
+            return false;
+    for (int f = 0; f < fields; f++)
+        crc = v34_crc_bits(bits + 18 + 17 * f, 16, crc);
+    if (crc != get(bits, 18 + 17 * fields, 16))
+        return false;
+    memset(o, 0, sizeof(*o));
+    o->type = type;
+    o->max_rate = (int) get(bits, 20, 4);
+    o->cc2400 = bits[27];
+    o->trellis = (int) get(bits, 29, 2);
+    o->nonlinear = bits[31];
+    o->expanded = bits[32];
+    o->rate_mask = get(bits, 35, 15) & 0x3FFFu;
+    o->asymmetric_cc = bits[50];
+    if (type)
+        for (int k = 0; k < 6; k++)
+            o->h[k / 2][k % 2] = (int16_t) get(bits, 52 + 17 * k, 16);
+    return true;
+}
+
 /* ------------------------------------------------------------------ V.8 */
 
 /* Tags in the low five bits of an octet; extension octets have 010 in
@@ -281,7 +389,8 @@ int v8_build(const v8_msg_t *m, uint8_t *oct, int max)
         return 0;
     oct[n++] = (uint8_t) ((m->call_function << 5) | V8_TAG_CALL);
     oct[n++] = (uint8_t) (V8_TAG_MOD | (m->v34 ? 0x40 : 0) | (m->v34hdx ? 0x80 : 0));
-    oct[n++] = (uint8_t) (0x10 | (m->v32 ? 0x01 : 0) | (m->v22 ? 0x02 : 0));
+    oct[n++] = (uint8_t) (0x10 | (m->v32 ? 0x01 : 0) | (m->v22 ? 0x02 : 0) | (m->v17 ? 0x04 : 0) |
+                          (m->v29 ? 0x40 : 0) | (m->v27ter ? 0x80 : 0));
     oct[n++] = (uint8_t) (0x10 | (m->v21 ? 0x80 : 0));
     if (m->lapm)
         oct[n++] = (uint8_t) ((1 << 5) | V8_TAG_PROT);
@@ -311,6 +420,9 @@ bool v8_parse(const uint8_t *oct, int n, v8_msg_t *m)
             {
                 m->v32 = (oct[i] & 0x01) != 0;
                 m->v22 = (oct[i] & 0x02) != 0;
+                m->v17 = (oct[i] & 0x04) != 0;
+                m->v29 = (oct[i] & 0x40) != 0;
+                m->v27ter = (oct[i] & 0x80) != 0;
                 i++;
                 if (i < n && V8_EXT(oct[i]))
                 {

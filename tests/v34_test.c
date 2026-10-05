@@ -8,6 +8,7 @@
 #include "v34_codec.h"
 #include "v34_info.h"
 #include "v34_dsp.h"
+#include "v34_cc.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -467,6 +468,72 @@ static void test_info(void)
     CHECK(v34_mp_unpack(bits, n, &mq) && memcmp(&mp, &mq, sizeof(mp)) == 0, "MP type 0 does not survive a round trip");
 }
 
+/* The half-duplex sequences, INFOh and MPh (10.2), and V.8's fax
+ * modulations. */
+static void test_hdx_info(void)
+{
+    v34_infoh_t h = { 0 }, h2;
+    v34_mph_t m = { 0 }, m2;
+    v8_msg_t cm = { 0 }, cm2;
+    uint8_t bits[256], oct[16];
+    int n;
+
+    h.power_reduction = 3;
+    h.trn_len = 100;
+    h.high = true;
+    h.pre_emphasis = 9;
+    h.sr = V34_S3200;
+    h.trn16 = true;
+    n = v34_infoh_pack(&h, bits);
+    CHECK(n == V34_INFOH_BITS, "INFOh is %d bits", n);
+    CHECK(memcmp(bits, "\1\1\1\1\0\1\1\1\0\0\1\0", 12) == 0, "INFOh does not start 1111 01110010");
+    /* Table 22, bit by bit: 12:14 power reduction, 15:21 TRN, 22 carrier,
+     * 23:26 pre-emphasis, 27:29 symbol rate, 30 TRN16, LSB first. */
+    CHECK(bits[12] == 1 && bits[13] == 1 && bits[14] == 0, "INFOh power reduction misplaced");
+    CHECK(bits[22] == 1 && bits[30] == 1, "INFOh carrier or TRN16 misplaced");
+    CHECK(bits[27] == 0 && bits[28] == 0 && bits[29] == 1, "INFOh symbol rate misplaced");
+    CHECK(bits[47] && bits[48] && bits[49] && bits[50], "INFOh does not end in fill");
+    CHECK(v34_infoh_unpack(bits, n, &h2) && memcmp(&h, &h2, sizeof(h)) == 0, "INFOh does not survive a round trip");
+    bits[25] ^= 1;
+    CHECK(!v34_infoh_unpack(bits, n, &h2), "a damaged INFOh passes its CRC");
+
+    m.type = 0;
+    m.max_rate = 14;
+    m.cc2400 = true;
+    m.trellis = 1;
+    m.expanded = true;
+    m.rate_mask = 0x3FFF;
+    m.asymmetric_cc = true;
+    n = v34_mph_pack(&m, bits);
+    CHECK(n == V34_MPH0_BITS, "MPh type 0 is %d bits", n);
+    /* Table 23: 20:23 rate, 27 control channel rate, 29:30 trellis, 32
+     * shaping, 50 asymmetric; start bits at 17, 34, 51, 68. */
+    CHECK(bits[20] == 0 && bits[21] == 1 && bits[22] == 1 && bits[23] == 1, "MPh rate misplaced");
+    CHECK(bits[27] == 1 && bits[29] == 1 && bits[30] == 0 && bits[32] == 1 && bits[50] == 1,
+          "MPh control channel, trellis, shaping or asymmetry misplaced");
+    CHECK(!bits[17] && !bits[34] && !bits[51] && !bits[68], "MPh start bits are not zero");
+    CHECK(v34_mph_unpack(bits, n, &m2) && memcmp(&m, &m2, sizeof(m)) == 0, "MPh does not survive a round trip");
+    bits[40] ^= 1;
+    CHECK(!v34_mph_unpack(bits, n, &m2), "a damaged MPh passes its CRC");
+    m.type = 1;
+    m.h[1][0] = -321;
+    m.h[2][1] = 9999;
+    n = v34_mph_pack(&m, bits);
+    CHECK(n == V34_MPH1_BITS, "MPh type 1 is %d bits", n);
+    CHECK(v34_mph_unpack(bits, n, &m2) && memcmp(&m, &m2, sizeof(m)) == 0, "MPh type 1 does not survive a round trip");
+
+    /* A Super G3 CM: T.30 transmit, V.34 half duplex and the G3 modulations. */
+    cm.call_function = 4;
+    cm.v34hdx = true;
+    cm.v17 = cm.v29 = cm.v27ter = cm.v21 = true;
+    n = v8_build(&cm, oct, (int) sizeof(oct));
+    CHECK(n == 4 && oct[0] == 0x81 && oct[1] == 0x85 && oct[2] == 0xD4 && oct[3] == 0x90,
+          "fax CM octets %02X %02X %02X %02X", oct[0], oct[1], oct[2], oct[3]);
+    CHECK(v8_parse(oct, n, &cm2) && cm2.call_function == 4 && cm2.v34hdx && !cm2.v34 && cm2.v17 && cm2.v29 &&
+              cm2.v27ter && cm2.v21 && !cm2.v32,
+          "fax CM does not survive a round trip");
+}
+
 /* Phase 2's DPSK: tone, an INFO sequence, tone, through the transmitter and
  * receiver of v34_dsp.c - for both carriers, at a few starting phases. */
 static int dpsk_once(bool answerer, int offset, int delay, bool info0)
@@ -539,6 +606,355 @@ static void test_dpsk(void)
     CHECK(fails == 0, "%d of 120 DPSK INFO sequences lost", fails);
 }
 
+/* G.711 mu-law, as G.711 tabulates it: a line through a telephone network. */
+static uint8_t linear_to_ulaw(int16_t x)
+{
+    int sign = (x < 0) ? 0x80 : 0, mag = (x < 0) ? -(int) x : x, seg = 0;
+
+    mag += 0x84;
+    if (mag > 0x7FFF)
+        mag = 0x7FFF;
+    for (int m = mag >> 7; m > 1 && seg < 7; m >>= 1)
+        seg++;
+    return (uint8_t) ~(sign | (seg << 4) | ((mag >> (seg + 3)) & 0x0F));
+}
+
+static int16_t ulaw_to_linear(uint8_t u)
+{
+    int t;
+
+    u = (uint8_t) ~u;
+    t = (((u & 0x0F) << 3) + 0x84) << ((u & 0x70) >> 4);
+    return (int16_t) ((u & 0x80) ? 0x84 - t : t - 0x84);
+}
+
+/* PPh (10.2.4.5) as read with k - I: a perfect sequence, its periodic
+ * autocorrelation zero away from lag 0. */
+static void test_pph(void)
+{
+    float worst = 0.0f;
+
+    for (int lag = 1; lag < 8; lag++)
+    {
+        v34_cf_t c = 0.0f;
+
+        for (int i = 0; i < 8; i++)
+            c += v34_pph(i) * conjf(v34_pph(i + lag));
+        if (cabsf(c) > worst)
+            worst = cabsf(c);
+    }
+    CHECK(worst < 1e-4f, "PPh's periodic autocorrelation reaches %.3f off lag 0", worst);
+    CHECK(cabsf(v34_pph(0) - v34_cc_point(0)) < 1e-5f, "PPh(0) is not point 0");
+}
+
+/* A control channel transmitter driven the way the half-duplex start-up
+ * drives it: a little program of signals. */
+typedef enum
+{
+    CC_SIL,
+    CC_PPH,
+    CC_ALT,
+    CC_MPH,
+    CC_E,
+    CC_DATA,
+    CC_SH,
+    CC_SHB,
+    CC_AC,
+    CC_END
+} ccsig_t;
+
+typedef struct
+{
+    ccsig_t prog[16];
+    int len[16];
+    int np, ip, count;
+    int tap;
+    uint32_t scr;
+    int z;
+    uint8_t mph[V34_MPH0_BITS];
+    int mph_n, mph_pos;
+    uint32_t data_rng;
+    long long data_sent;
+} cctest_tx_t;
+
+static int cct_bit(cctest_tx_t *t, int b)
+{
+    return v34_scramble(&t->scr, t->tap, b);
+}
+
+static uint8_t data_bit(uint32_t *st)
+{
+    *st ^= *st << 13;
+    *st ^= *st >> 17;
+    *st ^= *st << 5;
+    return (uint8_t) (*st & 1);
+}
+
+static v34_cf_t cct_diff(cctest_tx_t *t, int b0, int b1)
+{
+    int i1 = cct_bit(t, b0), i2 = cct_bit(t, b1);
+
+    t->z = (t->z + i1 + 2 * i2) & 3;
+    return v34_cc_point(t->z);
+}
+
+static v34_cf_t cct_symbol(void *user)
+{
+    cctest_tx_t *t = user;
+    v34_cf_t s = 0.0f;
+    int i;
+
+    while (t->ip < t->np && t->len[t->ip] >= 0 && t->count >= t->len[t->ip])
+    {
+        t->ip++;
+        t->count = 0;
+        if (t->ip < t->np && t->prog[t->ip] == CC_ALT)
+            t->scr = 0;     /* 10.2.4.2 */
+        if (t->ip < t->np && t->prog[t->ip] == CC_MPH)
+            t->mph_pos = 0;
+    }
+    if (t->ip >= t->np)
+        return 0.0f;
+    i = t->count++;
+    switch (t->prog[t->ip])
+    {
+    case CC_SIL:
+    case CC_END:
+        break;
+    case CC_PPH:
+        s = v34_pph(i);
+        break;
+    case CC_SH:
+        s = v34_cc_point((i & 1) ? 3 : 0);
+        break;
+    case CC_SHB:
+        s = v34_cc_point((i & 1) ? 1 : 2);
+        break;
+    case CC_AC:
+        s = v34_cc_point((i & 1) ? 2 : 0);
+        break;
+    case CC_ALT:
+        s = cct_diff(t, 0, 1);
+        break;
+    case CC_MPH:
+    {
+        int b0 = t->mph[t->mph_pos % t->mph_n], b1 = t->mph[(t->mph_pos + 1) % t->mph_n];
+
+        t->mph_pos += 2;
+        s = cct_diff(t, b0, b1);
+        break;
+    }
+    case CC_E:
+        s = cct_diff(t, 1, 1);
+        break;
+    case CC_DATA:
+    {
+        int b0 = data_bit(&t->data_rng), b1 = data_bit(&t->data_rng);
+
+        t->data_sent += 2;
+        s = cct_diff(t, b0, b1);
+        break;
+    }
+    }
+    return s;
+}
+
+typedef struct
+{
+    int pph, shbar, ac;
+    long long pph_sym, shbar_sym, ac_sym;
+    bool got_mph, got_e;
+    v34_mph_t mph;
+    uint8_t buf[V34_MPH1_BITS];
+    int nbuf;
+    bool in_mph;
+    uint32_t sr;
+    int ones;
+    long long data_bits, data_errs, data_limit;
+    uint32_t data_rng;
+} cctest_rx_t;
+
+static void cct_rx_bit(cctest_rx_t *r, int b)
+{
+    if (r->got_e)
+    {
+        /* Only as far as data was sent: silence follows it. */
+        if (r->data_bits < r->data_limit)
+        {
+            uint8_t want = data_bit(&r->data_rng);
+
+            r->data_bits++;
+            r->data_errs += (b != want);
+        }
+        return;
+    }
+    r->sr = (r->sr << 1) | (uint32_t) b;
+    r->ones = b ? r->ones + 1 : 0;
+    if (r->in_mph)
+    {
+        r->buf[r->nbuf++] = (uint8_t) b;
+        if (r->nbuf == V34_MPH0_BITS)
+        {
+            r->in_mph = false;
+            if (v34_mph_unpack(r->buf, r->nbuf, &r->mph))
+                r->got_mph = true;
+        }
+    }
+    else if (!b && (r->sr & 0x3FFFF) == 0x3FFFE)
+    {
+        memset(r->buf, 1, 17);
+        r->buf[17] = 0;
+        r->nbuf = 18;
+        r->in_mph = true;
+    }
+    if (r->got_mph && r->ones == 20 && !r->in_mph)
+        r->got_e = true;
+}
+
+/* One control channel start-up, one way, over a line: delay, loss, G.711,
+ * noise, clock drift, and our own signal in the other band as echo. */
+static int cc_once(bool far_answerer, int delay, double loss_db, double noise_db, double ppm, bool start,
+                   char *why, size_t why_len)
+{
+    static cctest_tx_t t, near;
+    static v34_cctx_t tx, ntx;
+    static v34_ccrx_t rx;
+    cctest_rx_t r = { 0 };
+    v34_mph_t m = { 0 };
+    static float line[8192];
+    double g = pow(10.0, -loss_db / 20.0);
+    double nrms = V34_DBM0_RMS * pow(10.0, noise_db / 20.0);
+    long long total = 8000 * 6;
+    double pos = 0.0;
+
+    memset(&t, 0, sizeof(t));
+    memset(&near, 0, sizeof(near));
+    t.tap = far_answerer ? 5 : 18;
+    t.data_rng = 0x1234567u;
+    if (start)
+    {
+        m.max_rate = 12;
+        m.rate_mask = 0x0FFF;
+        t.mph_n = v34_mph_pack(&m, t.mph);
+        t.prog[0] = CC_SIL, t.len[0] = 60;
+        t.prog[1] = CC_PPH, t.len[1] = 32;
+        t.prog[2] = CC_ALT, t.len[2] = 40;
+        t.prog[3] = CC_MPH, t.len[3] = 88;
+        t.prog[4] = CC_E, t.len[4] = 10;
+        t.prog[5] = CC_DATA, t.len[5] = 1800;
+        t.prog[6] = CC_END, t.len[6] = -1;
+        t.np = 7;
+    }
+    else
+    {
+        /* The resynchronisation of 12.6, then a retrain's AC. */
+        t.prog[0] = CC_SIL, t.len[0] = 60;
+        t.prog[1] = CC_SH, t.len[1] = 24;
+        t.prog[2] = CC_SHB, t.len[2] = 8;
+        t.prog[3] = CC_ALT, t.len[3] = 40;
+        t.prog[4] = CC_SIL, t.len[4] = 120;
+        t.prog[5] = CC_AC, t.len[5] = 150;
+        t.prog[6] = CC_END, t.len[6] = -1;
+        t.np = 7;
+    }
+    r.data_rng = 0x1234567u;
+    r.data_limit = 2 * 1800;
+    /* Our own transmitter, sending data in the other band all the while. */
+    near.tap = far_answerer ? 18 : 5;
+    near.data_rng = 99;
+    near.prog[0] = CC_DATA, near.len[0] = -1;
+    near.np = 1;
+    v34_cctx_init(&tx, far_answerer, -13.0, cct_symbol, &t);
+    v34_cctx_init(&ntx, !far_answerer, -13.0, cct_symbol, &near);
+    v34_cctx_on(&tx, true);
+    v34_cctx_on(&ntx, true);
+    v34_ccrx_init(&rx, far_answerer, -13.0);
+    memset(line, 0, sizeof(line));
+    for (long long n = 0; n < total; n++)
+    {
+        float x, e;
+        int ev;
+
+        /* The far end's clock runs ppm fast: its samples arrive that much
+         * closer together. Linear interpolation is plenty at these rates. */
+        line[n & 8191] = v34_cctx_sample(&tx);
+        pos += 1.0 / (1.0 + ppm * 1e-6);
+        {
+            double at = (double) n - delay - (pos - (double) n);
+            long long i0 = (long long) floor(at);
+            float f = (float) (at - i0);
+
+            x = (i0 >= 1) ? line[i0 & 8191] * (1.0f - f) + line[(i0 + 1) & 8191] * f : 0.0f;
+        }
+        x = (float) (x * g + nrms * gauss());
+        e = v34_cctx_sample(&ntx) * 0.3f;
+        x = ulaw_to_linear(linear_to_ulaw((int16_t) lrintf(x + e)));
+        ev = v34_ccrx_sample(&rx, x);
+        if ((ev & V34_CC_EV_PPH) && !r.pph)
+        {
+            r.pph = 1;
+            r.pph_sym = rx.symbols;
+        }
+        if ((ev & V34_CC_EV_SHBAR) && !r.shbar)
+            r.shbar = 1;
+        if ((ev & V34_CC_EV_AC) && !r.ac)
+            r.ac = 1;
+        for (int i = 0; i < rx.nbits; i++)
+            cct_rx_bit(&r, rx.bits[i]);
+    }
+    if (start)
+    {
+        if (!r.pph)
+            snprintf(why, why_len, "PPh not recognised");
+        else if (!r.got_mph)
+            snprintf(why, why_len, "no MPh");
+        else if (r.mph.max_rate != 12 || r.mph.rate_mask != 0x0FFF)
+            snprintf(why, why_len, "MPh garbled");
+        else if (!r.got_e)
+            snprintf(why, why_len, "no E");
+        else if (r.data_bits < r.data_limit || r.data_errs > 0)
+            snprintf(why, why_len, "%lld errors in %lld data bits", r.data_errs, r.data_bits);
+        else
+            return 1;
+        return 0;
+    }
+    if (!r.shbar)
+        snprintf(why, why_len, "Sh and S-bar-h not recognised");
+    else if (!r.ac)
+        snprintf(why, why_len, "AC not recognised");
+    else
+        return 1;
+    return 0;
+}
+
+static void test_cc(void)
+{
+    static const struct
+    {
+        int delay;
+        double loss, noise, ppm;
+    } lines[] = { { 0, 0.0, -90.0, 0.0 },  { 37, 10.0, -60.0, 0.0 }, { 251, 20.0, -50.0, 80.0 },
+                  { 5, 30.0, -55.0, -100.0 }, { 123, 6.0, -45.0, 40.0 } };
+    int fails = 0, runs = 0;
+    char why[96];
+
+    for (int ans = 0; ans < 2; ans++)
+        for (size_t l = 0; l < sizeof(lines) / sizeof(lines[0]); l++)
+            for (int start = 0; start < 2; start++)
+            {
+                runs++;
+                if (!cc_once(ans, lines[l].delay, lines[l].loss, lines[l].noise, lines[l].ppm, start, why,
+                             sizeof(why)))
+                {
+                    fails++;
+                    printf("  control channel from the %s, %s, delay %d, loss %.0f dB, noise %.0f dBm0, %+.0f ppm: %s\n",
+                           ans ? "answerer" : "caller", start ? "start-up" : "resync and AC", lines[l].delay,
+                           lines[l].loss, lines[l].noise, lines[l].ppm, why);
+                }
+            }
+    CHECK(fails == 0, "%d of %d control channel runs failed", fails, runs);
+}
+
 int main(void)
 {
     printf("V.34 unit tests\n");
@@ -551,7 +967,10 @@ int main(void)
     test_precoder();
     test_crc();
     test_info();
+    test_hdx_info();
     test_dpsk();
+    test_pph();
+    test_cc();
     if (failures)
     {
         printf("%d FAILED\n", failures);

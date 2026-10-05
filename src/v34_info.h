@@ -74,6 +74,36 @@ typedef struct
     int16_t h[3][2];
 } v34_mp_t;
 
+/* INFOh (Table 22): sent by the recipient in a half-duplex start-up, it
+ * settles the source's transmitter for Phase 3 and the data that follows. */
+typedef struct
+{
+    int power_reduction;      /* 0..7 dB */
+    int trn_len;              /* the source's Phase 3 TRN, in 35 ms units, 0..127 */
+    bool high;                /* the high carrier */
+    int pre_emphasis;         /* 0..10 */
+    int sr;                   /* V34_S2400 ... V34_S3429 */
+    bool trn16;               /* TRN on the 16-point constellation */
+} v34_infoh_t;
+
+/* MPh (Tables 23 and 24): the half-duplex MP. The same frame as MP, but one
+ * rate rather than two, and the control channel's settings. */
+typedef struct
+{
+    int type;                 /* 0, or 1 with precoding coefficients */
+    int max_rate;             /* x 2400, 1..14 */
+    bool cc2400;              /* control channel at 2400 bit/s for the remote transmitter */
+    int trellis;              /* 0 16 states, 1 32, 2 64: for the remote transmitter */
+    bool nonlinear;
+    bool expanded;
+    unsigned rate_mask;       /* bit 0 2400 ... bit 13 33600 */
+    bool asymmetric_cc;       /* asymmetric control channel rates allowed */
+    int16_t h[3][2];
+} v34_mph_t;
+
+#define V34_INFOH_BITS 51
+#define V34_MPH0_BITS 88
+#define V34_MPH1_BITS 188
 #define V34_INFO0_BITS 49
 #define V34_INFO1C_BITS 109
 #define V34_INFO1A_BITS 70
@@ -89,6 +119,11 @@ bool v34_info1a_unpack(const uint8_t *bits, int n, v34_info1a_t *out);
 int v34_mp_pack(const v34_mp_t *in, uint8_t *bits);
 /* bits starts at the frame sync. False on a bad CRC or a malformed frame. */
 bool v34_mp_unpack(const uint8_t *bits, int n, v34_mp_t *out);
+int v34_infoh_pack(const v34_infoh_t *in, uint8_t *bits);
+bool v34_infoh_unpack(const uint8_t *bits, int n, v34_infoh_t *out);
+int v34_mph_pack(const v34_mph_t *in, uint8_t *bits);
+/* As v34_mp_unpack. */
+bool v34_mph_unpack(const uint8_t *bits, int n, v34_mph_t *out);
 
 /* Tables 18 and 19, left-most bit first in time. */
 #define V34_J4 0x0991u        /* 0000100110010001 */
@@ -100,11 +135,14 @@ bool v34_mp_unpack(const uint8_t *bits, int n, v34_mp_t *out);
 /* What CM and JM say, in the parts V.34 cares about. */
 typedef struct
 {
-    int call_function;        /* 6: V-series data */
+    int call_function;        /* 4: T.30 transmit, 5: T.30 receive, 6: V-series data */
     bool v34;                 /* duplex */
     bool v34hdx;
     bool v32;                 /* V.32/V.32bis */
     bool v22;
+    bool v17;                 /* the half-duplex fax modulations */
+    bool v29;
+    bool v27ter;
     bool v21;
     bool lapm;                /* protocols octet: V.42 LAPM */
     bool pcm;                 /* a V.90/V.92 modem availability octet was seen */
