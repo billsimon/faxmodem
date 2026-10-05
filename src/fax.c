@@ -1,4 +1,5 @@
 #include "faxmodem/fax.h"
+#include "faxmodem/fax_v34.h"
 #include "faxmodem/log.h"
 #include "faxmodem/tiff_probe.h"
 #include "faxmodem/util.h"
@@ -196,6 +197,14 @@ static void refresh_status(struct fm_fax *s)
     s->status.pages_rx = stats.pages_rx;
     s->status.bit_rate = stats.bit_rate;
     s->status.ecm = stats.error_correcting_mode != 0;
+    /* Under V.34, T.30's own rate is the dummy its DCS carried. */
+    {
+        fm_v34h_stats_t vs;
+
+        s->status.v34 = fax_v34_active(s->fax);
+        if (s->status.v34 && fax_v34_stats(s->fax, &vs) && vs.rate > 0)
+            s->status.bit_rate = vs.rate;
+    }
     s->status.bad_rows = stats.bad_rows;
 
     ident = t30_get_rx_ident(t30);
@@ -219,9 +228,9 @@ static int phase_d_handler(t30_state_t *t30, void *user_data, int result)
 
     refresh_status(s);
     fm_log_event(FM_LOG_INFO, "fax", "page complete",
-                 "tag=%s pages_tx=%d pages_rx=%d bit_rate=%d ecm=%s bad_rows=%d frame=%s", s->tag,
-                 s->status.pages_tx, s->status.pages_rx, s->status.bit_rate, s->status.ecm ? "yes" : "no",
-                 s->status.bad_rows, t30_frametype((uint8_t) result));
+                 "tag=%s pages_tx=%d pages_rx=%d bit_rate=%d v34=%s ecm=%s bad_rows=%d frame=%s", s->tag,
+                 s->status.pages_tx, s->status.pages_rx, s->status.bit_rate, s->status.v34 ? "yes" : "no",
+                 s->status.ecm ? "yes" : "no", s->status.bad_rows, t30_frametype((uint8_t) result));
     return T30_ERR_OK;
 }
 
@@ -237,10 +246,11 @@ static void phase_e_handler(t30_state_t *t30, void *user_data, int completion_co
     s->completed = true;
 
     fm_log_event(completion_code == T30_ERR_OK ? FM_LOG_INFO : FM_LOG_ERROR, "fax", "transfer finished",
-                 "tag=%s result=%d result_text=\"%s\" pages_tx=%d pages_rx=%d bit_rate=%d ecm=%s "
+                 "tag=%s result=%d result_text=\"%s\" pages_tx=%d pages_rx=%d bit_rate=%d v34=%s ecm=%s "
                  "remote_id=\"%s\" own_echoes=%d",
                  s->tag, completion_code, s->status.result_text, s->status.pages_tx, s->status.pages_rx,
-                 s->status.bit_rate, s->status.ecm ? "yes" : "no", s->status.remote_ident, s->echoes);
+                 s->status.bit_rate, s->status.v34 ? "yes" : "no", s->status.ecm ? "yes" : "no",
+                 s->status.remote_ident, s->echoes);
 }
 
 /* Only frames arriving from the far end count. Page completions alone are too
@@ -349,7 +359,8 @@ static void configure_t30(struct fm_fax *s, const fm_fax_params_t *p)
     if (p->header != NULL && *p->header != '\0')
         t30_set_tx_page_header_info(t30, p->header);
 
-    t30_set_ecm_capability(t30, p->ecm ? TRUE : FALSE);
+    /* V.34 needs ECM (T.30 Annex F). */
+    t30_set_ecm_capability(t30, (p->ecm || p->v34) ? TRUE : FALSE);
     t30_set_supported_compressions(t30, T30_SUPPORT_T4_1D_COMPRESSION | T30_SUPPORT_T4_2D_COMPRESSION |
                                             T30_SUPPORT_T6_COMPRESSION);
     t30_set_supported_modems(t30, modems_for_speed(p->max_speed));
@@ -410,10 +421,22 @@ fm_fax_t *fm_fax_create(const fm_fax_params_t *params)
     attach_logging(fax_get_logging_state(s->fax), s->tag);
     configure_t30(s, params);
     echo_guard_install(s);
+    if (params->v34)
+    {
+        fax_v34_config_t vc;
+
+        memset(&vc, 0, sizeof(vc));
+        vc.max_rate = params->v34_max_rate > 0 ? params->v34_max_rate : 33600;
+        vc.tx_power = -12.0f;
+        vc.tag = s->tag;
+        if (fax_v34_enable(s->fax, &vc) != 0)
+            FM_WARN("fax", "tag=%s could not offer V.34; G3 only", s->tag);
+    }
 
     fm_log_event(FM_LOG_INFO, "fax", "engine started",
-                 "tag=%s role=%s ecm=%s max_speed=%d station_id=\"%s\" tx_file=\"%s\" rx_file=\"%s\"", s->tag,
-                 params->calling ? "transmit" : "receive", params->ecm ? "on" : "off", params->max_speed,
+                 "tag=%s role=%s ecm=%s max_speed=%d v34=%s station_id=\"%s\" tx_file=\"%s\" rx_file=\"%s\"",
+                 s->tag, params->calling ? "transmit" : "receive", params->ecm || params->v34 ? "on" : "off",
+                 params->max_speed, params->v34 ? "offered" : "off",
                  params->station_id ? params->station_id : "", params->tx_file ? params->tx_file : "",
                  params->rx_file ? params->rx_file : "");
     return s;
@@ -729,6 +752,7 @@ int fm_fax_selftest(const fm_config_t *cfg)
     int64_t started;
     long iterations = 0;
     const long max_iterations = (long) SELFTEST_MAX_SECONDS * 8000 / SELFTEST_CHUNK;
+    const char *v34_only = getenv("FAXMODEM_SELFTEST_V34");
 
     if (!fm_tiff_probe(cfg->file, &info, err, sizeof(err)))
     {
@@ -755,6 +779,10 @@ int fm_fax_selftest(const fm_config_t *cfg)
     tx_params.header = cfg->header;
     tx_params.ecm = cfg->ecm;
     tx_params.max_speed = cfg->max_speed;
+    /* FAXMODEM_SELFTEST_V34=tx or rx offers V.34 from that side only, for
+     * the fall back to G3 against a machine without it. A test hook. */
+    tx_params.v34 = cfg->v34 && !(v34_only != NULL && strcmp(v34_only, "rx") == 0);
+    tx_params.v34_max_rate = cfg->v34_max_rate;
     tx_params.unlimited_length = cfg->unlimited_page_length;
     tx_params.tag = "selftest-tx";
 
@@ -764,6 +792,8 @@ int fm_fax_selftest(const fm_config_t *cfg)
     rx_params.station_id = "faxmodem-rx";
     rx_params.ecm = cfg->ecm;
     rx_params.max_speed = cfg->max_speed;
+    rx_params.v34 = cfg->v34 && !(v34_only != NULL && strcmp(v34_only, "tx") == 0);
+    rx_params.v34_max_rate = cfg->v34_max_rate;
     rx_params.unlimited_length = cfg->unlimited_page_length;
     rx_params.tag = "selftest-rx";
 
@@ -803,10 +833,10 @@ int fm_fax_selftest(const fm_config_t *cfg)
     }
 
     fm_log_event(rc == FM_EXIT_OK ? FM_LOG_INFO : FM_LOG_ERROR, "selftest", "result",
-                 "tx_result=\"%s\" rx_result=\"%s\" pages_tx=%d pages_rx=%d bit_rate=%d ecm=%s "
+                 "tx_result=\"%s\" rx_result=\"%s\" pages_tx=%d pages_rx=%d bit_rate=%d v34=%s ecm=%s "
                  "simulated_seconds=%.1f wall_ms=%" PRId64 " output=\"%s\"",
                  tx_status.result_text, rx_status.result_text, tx_status.pages_tx, rx_status.pages_rx,
-                 rx_status.bit_rate, rx_status.ecm ? "yes" : "no",
+                 rx_status.bit_rate, rx_status.v34 ? "yes" : "no", rx_status.ecm ? "yes" : "no",
                  (double) iterations * SELFTEST_CHUNK / 8000.0, fm_now_ms() - started, out_path);
 
     fm_fax_destroy(tx);

@@ -24,6 +24,8 @@ typedef struct
     int max_speed;           /* 14400 | 9600 | 4800 | 2400 */
     bool fine_only;          /* refuse standard (98 dpi) resolution */
     bool unlimited_length;   /* accept pages of unbounded length */
+    bool v34;                /* offer V.34 half duplex (T.30 Annex F); ECM is then always on */
+    int v34_max_rate;        /* its ceiling, 2400 ... 33600 */
     const char *tag;         /* short label for logs, e.g. a call id */
 } fm_fax_params_t;
 
@@ -36,6 +38,7 @@ typedef struct
     int pages_rx;
     int bit_rate;
     bool ecm;
+    bool v34;                /* the call ran on V.34; bit_rate is its primary channel's */
     int bad_rows;
     char remote_ident[41];
 } fm_fax_status_t;

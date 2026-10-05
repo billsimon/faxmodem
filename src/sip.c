@@ -299,6 +299,8 @@ static fm_call_t *call_create(const fm_config_t *cfg, bool inbound, const char *
     params.header = cfg->header;
     params.ecm = cfg->ecm;
     params.max_speed = cfg->max_speed;
+    params.v34 = cfg->v34;
+    params.v34_max_rate = cfg->v34_max_rate;
     params.fine_only = cfg->fine_resolution_only;
     params.unlimited_length = cfg->unlimited_page_length;
     params.tag = c->tag;

@@ -117,6 +117,64 @@
 
 #define HDLC_FRAMING_OK_THRESHOLD       8
 
+/* faxmodem: V.34 (T.30 Annex F). fax_state_t is laid out as the installed
+   library lays it out, so what V.34 needs goes in a wrapper that fax_init()
+   allocates, with fax_state_t first; see include/faxmodem/fax_v34.h. */
+#include <stddef.h>
+#include "faxmodem/fax_v34.h"
+
+#define FAX_V34_MAGIC 0x56333448u   /* "V34H" */
+
+enum
+{
+    V34_OFF = 0,        /* not offered, or V.8 did not settle on it: plain G3 */
+    V34_PHASE1,         /* V.8 under way; the caller's G3 CNG and V.21 run alongside */
+    V34_ON              /* T.30 runs over the control and primary channels */
+};
+
+typedef struct
+{
+    fax_state_t fax;
+    uint32_t magic;
+    int state;
+    bool calling;
+    fm_v34h_t *modem;
+    bool drop_modem;    /* V.8 came to nothing: free the modem out of its callback */
+    bool step_due;      /* a SEND_STEP_COMPLETE to give T.30 once the modem call returns */
+    int tx_type, rx_type;
+    long long pause_left;
+    int idle_bit;       /* flags for the control channel while T.30 has nothing for it */
+    fm_v34h_stats_t last;
+    bool used;
+} fax_x_t;
+
+static fax_x_t *fax_x(fax_state_t *s)
+{
+    fax_x_t *x = (fax_x_t *) s;
+
+    return (x != NULL  &&  x->magic == FAX_V34_MAGIC)  ?  x  :  NULL;
+}
+
+static fax_x_t *fax_x_from_t30(t30_state_t *t)
+{
+    return fax_x((fax_state_t *) ((char *) t - offsetof(fax_state_t, t30)));
+}
+
+/* Hooks for the patched t30.c. */
+int fm_t30_v8_capable(t30_state_t *t)
+{
+    fax_x_t *x = fax_x_from_t30(t);
+
+    return x != NULL  &&  x->state != V34_OFF;
+}
+
+int fm_t30_v34_active(t30_state_t *t)
+{
+    fax_x_t *x = fax_x_from_t30(t);
+
+    return x != NULL  &&  x->state == V34_ON;
+}
+
 static void fax_send_hdlc(void *user_data, const uint8_t *msg, int len)
 {
     fax_state_t *s;
@@ -307,7 +365,180 @@ static int v29_v21_rx_fillin(void *user_data, int len)
 }
 /*- End of function --------------------------------------------------------*/
 
+static int fax_rx_g3(fax_state_t *s, int16_t *amp, int len);
+static int fax_tx_g3(fax_state_t *s, int16_t *amp, int max_len);
+
+/* The control channel idles on flags while T.30 has nothing for it. */
+static int v34_flag_bit(fax_x_t *x)
+{
+    int b = (0x7E >> (7 - x->idle_bit)) & 1;
+
+    x->idle_bit = (x->idle_bit + 1) & 7;
+    return b;
+}
+
+static int v34_cc_get_bit(void *user)
+{
+    fax_x_t *x = (fax_x_t *) user;
+    int b;
+
+    /* Always from the HDLC transmitter, which idles on flags between
+       frames: one stream of flags, unbroken. Switching between a flag
+       generator of our own and it broke a flag where they met, and the far
+       receiver, counting flags afresh, missed the frame that followed. */
+    b = hdlc_tx_get_bit(&x->fax.modems.hdlc_tx);
+    if (b < 0)
+    {
+        /* T.30's frames are out: tell it, as the end of a V.21
+           transmission would. The transmitter idles on flags after this,
+           which is what the control channel wants. The transmit type is
+           left alone: changed here, behind spandsp's back, T.30's next
+           request for V.21 matched spandsp's record of the current type,
+           was ignored, and its frames never went. */
+        x->step_due = TRUE;
+        b = hdlc_tx_get_bit(&x->fax.modems.hdlc_tx);
+        if (b < 0)
+            b = v34_flag_bit(x);
+    }
+    return b;
+}
+
+static void v34_cc_put_bit(void *user, int bit)
+{
+    fax_x_t *x = (fax_x_t *) user;
+
+    if (x->rx_type == T30_MODEM_V21)
+        hdlc_rx_put_bit(&x->fax.modems.hdlc_rx, bit);
+}
+
+static int v34_pc_get_bit(void *user)
+{
+    fax_x_t *x = (fax_x_t *) user;
+    int b;
+
+    b = hdlc_tx_get_bit(&x->fax.modems.hdlc_tx);
+    if (b < 0)
+    {
+        /* The partial page is out; the modem turns back to the control
+           channel, where T.30's PPS will go. */
+        x->step_due = TRUE;
+        return -1;
+    }
+    return b;
+}
+
+static void v34_pc_put_bit(void *user, int bit)
+{
+    fax_x_t *x = (fax_x_t *) user;
+
+    if (x->rx_type == T30_MODEM_V17  ||  x->rx_type == T30_MODEM_V29  ||  x->rx_type == T30_MODEM_V27TER)
+        hdlc_rx_put_bit(&x->fax.modems.hdlc_rx, bit);
+}
+
+static void v34_event(void *user, fm_v34h_event_t ev)
+{
+    fax_x_t *x = (fax_x_t *) user;
+    fax_state_t *s = &x->fax;
+
+    switch (ev)
+    {
+    case FM_V34H_CC_UP:
+        if (x->state == V34_PHASE1)
+        {
+            span_log(&s->logging, SPAN_LOG_FLOW, "V.34 control channel up: T.30 runs over V.34\n");
+            x->state = V34_ON;
+            x->used = TRUE;
+            x->tx_type = T30_MODEM_NONE;
+            x->rx_type = T30_MODEM_V21;
+            hdlc_rx_init(&s->modems.hdlc_rx, FALSE, TRUE, HDLC_FRAMING_OK_THRESHOLD, t30_hdlc_accept, &s->t30);
+            /* The answerer's "CED" - V.8 and V.34's start-up - is done: T.30
+               sends DIS now. The caller is already waiting for one. */
+            if (!x->calling)
+                x->step_due = TRUE;
+        }
+        break;
+    case FM_V34H_PRIMARY_UP:
+        if (!fm_v34h_is_source(x->modem))
+        {
+            hdlc_rx_put_bit(&s->modems.hdlc_rx, SIG_STATUS_CARRIER_UP);
+            hdlc_rx_put_bit(&s->modems.hdlc_rx, SIG_STATUS_TRAINING_SUCCEEDED);
+        }
+        break;
+    case FM_V34H_PRIMARY_DOWN:
+        hdlc_rx_put_bit(&s->modems.hdlc_rx, SIG_STATUS_CARRIER_DOWN);
+        break;
+    case FM_V34H_NOT_V34:
+        span_log(&s->logging, SPAN_LOG_FLOW, "No V.34: carrying on as G3\n");
+        x->state = V34_OFF;
+        x->drop_modem = TRUE;
+        /* The answerer's ANSam stood in for CED; DIS goes on V.21. */
+        if (!x->calling)
+            x->step_due = TRUE;
+        break;
+    case FM_V34H_FAILED:
+        span_log(&s->logging, SPAN_LOG_WARNING, "V.34 failed\n");
+        break;
+    }
+}
+
+/* Whatever the modem's callbacks left for T.30, now that the modem is no
+   longer on the stack. */
+static void v34_after(fax_x_t *x)
+{
+    if (x->modem != NULL)
+        fm_v34h_stats(x->modem, &x->last);
+    if (x->drop_modem)
+    {
+        x->drop_modem = FALSE;
+        fm_v34h_free(x->modem);
+        x->modem = NULL;
+    }
+    if (x->step_due)
+    {
+        x->step_due = FALSE;
+        t30_front_end_status(&x->fax.t30, T30_FRONT_END_SEND_STEP_COMPLETE);
+    }
+}
+
+/* The caller in V.8's first moments: CNG and the V.21 receiver are T.30's,
+   and a G3 answerer's DIS there settles it. */
+static bool v34_g3_alongside(fax_x_t *x)
+{
+    return x->state == V34_PHASE1  &&  x->calling  &&  x->modem != NULL  &&  fm_v34h_in_v8(x->modem);
+}
+
 SPAN_DECLARE_NONSTD(int) fax_rx(fax_state_t *s, int16_t *amp, int len)
+{
+    fax_x_t *x = fax_x(s);
+
+    if (x != NULL  &&  x->state != V34_OFF  &&  x->modem != NULL)
+    {
+        if (v34_g3_alongside(x))
+        {
+            int16_t g3[len];
+            int i;
+
+            for (i = 0;  i < len;  i++)
+                g3[i] = dc_restore(&s->modems.dc_restore, amp[i]);
+            s->modems.rx_handler(s->modems.rx_user_data, g3, len);
+            if (s->t30.rx_frame_received)
+            {
+                /* A G3 answerer: its DIS came on V.21. */
+                span_log(&s->logging, SPAN_LOG_FLOW, "A V.21 frame arrived first: no V.34\n");
+                x->state = V34_OFF;
+                x->drop_modem = TRUE;
+            }
+        }
+        if (x->modem != NULL  &&  !x->drop_modem)
+            fm_v34h_rx(x->modem, amp, len);
+        v34_after(x);
+        t30_timer_update(&s->t30, len);
+        return 0;
+    }
+    return fax_rx_g3(s, amp, len);
+}
+
+static int fax_rx_g3(fax_state_t *s, int16_t *amp, int len)
 {
     int i;
 
@@ -325,6 +556,15 @@ SPAN_DECLARE_NONSTD(int) fax_rx(fax_state_t *s, int16_t *amp, int len)
 
 SPAN_DECLARE_NONSTD(int) fax_rx_fillin(fax_state_t *s, int len)
 {
+    fax_x_t *x = fax_x(s);
+
+    if (x != NULL  &&  x->state != V34_OFF  &&  x->modem != NULL)
+    {
+        fm_v34h_rx_fillin(x->modem, len);
+        v34_after(x);
+        t30_timer_update(&s->t30, len);
+        return 0;
+    }
     /* To mitigate the effect of lost packets on a packet network we should
        try to sustain the status quo. If there is no receive modem running, keep
        things that way. If there is a receive modem running, try to sustain its
@@ -372,6 +612,34 @@ static int set_next_tx_type(fax_state_t *s)
 /*- End of function --------------------------------------------------------*/
 
 SPAN_DECLARE_NONSTD(int) fax_tx(fax_state_t *s, int16_t *amp, int max_len)
+{
+    fax_x_t *x = fax_x(s);
+
+    if (x != NULL  &&  x->state != V34_OFF  &&  x->modem != NULL)
+    {
+        if (v34_g3_alongside(x))
+        {
+            /* CNG is T.30's; the modem is listening, and silent. */
+            int16_t quiet[max_len];
+            int len = fax_tx_g3(s, amp, max_len);
+
+            if (len < max_len)
+                memset(amp + len, 0, (max_len - len)*sizeof(int16_t));
+            fm_v34h_tx(x->modem, quiet, max_len);
+        }
+        else
+        {
+            fm_v34h_tx(x->modem, amp, max_len);
+            if (x->pause_left > 0  &&  (x->pause_left -= max_len) <= 0)
+                x->step_due = TRUE;
+        }
+        v34_after(x);
+        return max_len;
+    }
+    return fax_tx_g3(s, amp, max_len);
+}
+
+static int fax_tx_g3(fax_state_t *s, int16_t *amp, int max_len)
 {
     int len;
 #if defined(LOG_FAX_AUDIO)
@@ -432,6 +700,22 @@ static void fax_set_rx_type(void *user_data, int type, int bit_rate, int short_t
     span_log(&s->logging, SPAN_LOG_FLOW, "Set rx type %d\n", type);
     if (t->current_rx_type == type)
         return;
+    {
+        fax_x_t *x = fax_x(s);
+
+        if (x != NULL  &&  x->state == V34_ON)
+        {
+            /* V.21 is the control channel, any fast modem the primary. */
+            t->current_rx_type = type;
+            x->rx_type = type;
+            if (use_hdlc)
+                hdlc_rx_init(&t->hdlc_rx, FALSE, TRUE, HDLC_FRAMING_OK_THRESHOLD, t30_hdlc_accept, &s->t30);
+            if (type == T30_MODEM_V17  ||  type == T30_MODEM_V29  ||  type == T30_MODEM_V27TER)
+                fm_v34h_primary(x->modem);
+            set_rx_handler(s, (span_rx_handler_t *) &span_dummy_rx, (span_rx_fillin_handler_t *) &span_dummy_rx_fillin, s);
+            return;
+        }
+    }
     t->current_rx_type = type;
     t->rx_bit_rate = bit_rate;
     if (use_hdlc)
@@ -487,6 +771,50 @@ static void fax_set_tx_type(void *user_data, int type, int bit_rate, int short_t
     s = (fax_state_t *) user_data;
     t = &s->modems;
     span_log(&s->logging, SPAN_LOG_FLOW, "Set tx type %d\n", type);
+    {
+        fax_x_t *x = fax_x(s);
+
+        /* Under V.34 every request counts, repeated or not: the modem
+           decides what a repeat means. */
+        if (x != NULL  &&  x->state == V34_ON)
+        {
+            t->current_tx_type = type;
+            t->tx_bit_rate = bit_rate;
+            x->tx_type = type;
+            switch (type)
+            {
+            case T30_MODEM_V21:
+                /* The control channel is up already, idling on flags; ten
+                   more ahead of the frame give a receiver that has just
+                   restarted the eight it wants before it takes a frame. */
+                hdlc_tx_flags(&t->hdlc_tx, 10);
+                break;
+            case T30_MODEM_V27TER:
+            case T30_MODEM_V29:
+            case T30_MODEM_V17:
+                hdlc_tx_flags(&t->hdlc_tx, 16);
+                fm_v34h_primary(x->modem);
+                break;
+            case T30_MODEM_PAUSE:
+                x->pause_left = ms_to_samples(short_train);
+                if (x->pause_left <= 0)
+                    x->pause_left = 1;
+                break;
+            default:
+                break;
+            }
+            t->transmit = TRUE;
+            return;
+        }
+        if (x != NULL  &&  x->state == V34_PHASE1  &&  type == T30_MODEM_CED)
+        {
+            /* The answerer's ANSam, from the modem, stands in for CED; the
+               end of V.8 - one way or the other - is the end of it. */
+            t->current_tx_type = type;
+            t->transmit = TRUE;
+            return;
+        }
+    }
     if (t->current_tx_type == type)
         return;
     if (use_hdlc)
@@ -669,10 +997,19 @@ SPAN_DECLARE(fax_state_t *) fax_init(fax_state_t *s, int calling_party)
 
     if (s == NULL)
     {
-        if ((s = (fax_state_t *) malloc(sizeof(*s))) == NULL)
+        /* faxmodem: room for V.34 beside fax_state_t. */
+        fax_x_t *x;
+
+        if ((x = (fax_x_t *) calloc(1, sizeof(*x))) == NULL)
             return NULL;
+        x->magic = FAX_V34_MAGIC;
+        x->calling = calling_party;
+        s = &x->fax;
     }
-    memset(s, 0, sizeof(*s));
+    else
+    {
+        memset(s, 0, sizeof(*s));
+    }
     span_log_init(&s->logging, SPAN_LOG_NONE, NULL);
     span_log_set_protocol(&s->logging, "FAX");
     fax_modems_init(&s->modems,
@@ -718,16 +1055,75 @@ SPAN_DECLARE(fax_state_t *) fax_init(fax_state_t *s, int calling_party)
 
 SPAN_DECLARE(int) fax_release(fax_state_t *s)
 {
+    fax_x_t *x = fax_x(s);
+
     t30_release(&s->t30);
+    if (x != NULL  &&  x->modem != NULL)
+    {
+        fm_v34h_free(x->modem);
+        x->modem = NULL;
+    }
     return 0;
 }
 /*- End of function --------------------------------------------------------*/
 
 SPAN_DECLARE(int) fax_free(fax_state_t *s)
 {
-    t30_release(&s->t30);
+    fax_release(s);
     free(s);
     return 0;
+}
+
+int fax_v34_enable(fax_state_t *s, const fax_v34_config_t *cfg)
+{
+    fax_x_t *x = fax_x(s);
+    fm_v34h_params_t p;
+
+    if (x == NULL  ||  x->modem != NULL)
+        return -1;
+    memset(&p, 0, sizeof(p));
+    p.calling = x->calling;
+    p.max_rate = cfg->max_rate;
+    p.tx_power = cfg->tx_power;
+    p.symbol_rates = cfg->symbol_rates;
+    p.v17 = (s->t30.supported_modems & T30_SUPPORT_V17) != 0;
+    p.v29 = (s->t30.supported_modems & T30_SUPPORT_V29) != 0;
+    p.v27ter = (s->t30.supported_modems & T30_SUPPORT_V27TER) != 0;
+    p.tag = cfg->tag;
+    p.cc_get_bit = v34_cc_get_bit;
+    p.cc_put_bit = v34_cc_put_bit;
+    p.pc_get_bit = v34_pc_get_bit;
+    p.pc_put_bit = v34_pc_put_bit;
+    p.event = v34_event;
+    p.user = x;
+    if ((x->modem = fm_v34h_create(&p)) == NULL)
+        return -1;
+    x->state = V34_PHASE1;
+    /* Phase A again, with V.34 offered: DIS says V.8, and the answerer's
+       CED becomes the modem's ANSam. fax_modems_restart() does nothing in
+       0.0.6, so forget the modem types T.30 chose the first time round, or
+       asking for them again would be ignored. */
+    s->modems.current_tx_type = -1;
+    s->modems.current_rx_type = -1;
+    fax_restart(s, x->calling);
+    return 0;
+}
+
+bool fax_v34_active(fax_state_t *s)
+{
+    fax_x_t *x = fax_x(s);
+
+    return x != NULL  &&  x->state == V34_ON;
+}
+
+bool fax_v34_stats(fax_state_t *s, fm_v34h_stats_t *out)
+{
+    fax_x_t *x = fax_x(s);
+
+    if (x == NULL  ||  !x->used)
+        return false;
+    *out = x->last;
+    return true;
 }
 /*- End of function --------------------------------------------------------*/
 /*- End of file ------------------------------------------------------------*/

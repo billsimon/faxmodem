@@ -79,6 +79,8 @@ typedef struct
     char header[128];              /* page header text, "" disables */
     bool ecm;
     int max_speed;                 /* 2400..14400 */
+    bool v34;                      /* offer V.34 half duplex (Super G3, T.30 Annex F) */
+    int v34_max_rate;              /* 2400..33600, a multiple of 2400 */
     bool fine_resolution_only;
     bool unlimited_page_length;    /* advertise unbounded page length in DIS */
 

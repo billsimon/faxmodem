@@ -93,6 +93,10 @@
 
 #include "t30_local.h"
 
+/* faxmodem: V.34 (T.30 Annex F); answered by fax.c. */
+int fm_t30_v8_capable(t30_state_t *s);
+int fm_t30_v34_active(t30_state_t *s);
+
 /*! The maximum permitted number of retries of a single command allowed. */
 #define MAX_COMMAND_TRIES   3
 
@@ -1165,7 +1169,9 @@ int t30_build_dis_or_dtc(t30_state_t *s)
     if ((s->iaf & T30_IAF_MODE_T38))
         set_ctrl_bit(s->local_dis_dtc_frame, T30_DIS_BIT_T38);
     /* No 3G mobile  */
-    /* No V.8 */
+    /* faxmodem: V.8, when V.34 is offered (Annex F). */
+    if (fm_t30_v8_capable(s))
+        set_ctrl_bit(s->local_dis_dtc_frame, T30_DIS_BIT_V8_CAPABILITY);
     /* 256 octets preferred - don't bother making this optional, as everything uses 256 */
     /* Ready to transmit a fax (polling) will be determined separately, and this message edited. */
     /* Ready to receive a fax will be determined separately, and this message edited. */
@@ -1362,6 +1368,10 @@ static int build_dcs(t30_state_t *s)
 
     /* Set to required modem rate */
     s->dcs_frame[4] |= fallback_sequence[s->current_fallback].dcs_code;
+    /* faxmodem: under V.34 the data signalling rate is V.34's business, and
+       these bits are sent as zero (Annex F). */
+    if (fm_t30_v34_active(s))
+        s->dcs_frame[4] &= ~(DISBIT6 | DISBIT5 | DISBIT4 | DISBIT3);
 
     /* Select the compression to use. */
     switch (s->line_encoding)
@@ -2131,7 +2141,8 @@ static int process_rx_dis_dtc(t30_state_t *s, const uint8_t *msg, int len)
     memcpy(s->far_dis_dtc_frame, msg, s->far_dis_dtc_len);
     if (s->far_dis_dtc_len < T30_MAX_DIS_DTC_DCS_LEN)
         memset(s->far_dis_dtc_frame + s->far_dis_dtc_len, 0, T30_MAX_DIS_DTC_DCS_LEN - s->far_dis_dtc_len);
-    s->error_correcting_mode = (s->ecm_allowed  &&  (s->far_dis_dtc_frame[6] & DISBIT3) != 0);
+    /* faxmodem: ECM is mandatory under V.34 (Annex F). */
+    s->error_correcting_mode = ((s->ecm_allowed  ||  fm_t30_v34_active(s))  &&  (s->far_dis_dtc_frame[6] & DISBIT3) != 0);
     /* 256 octets per ECM frame */
     s->octets_per_ecm_frame = 256;
     /* Select the compression to use. */
@@ -2436,6 +2447,24 @@ static int process_rx_dcs(t30_state_t *s, const uint8_t *msg, int len)
             return -1;
         }
         s->operation_in_progress = OPERATION_IN_PROGRESS_T4_RX;
+    }
+    if (fm_t30_v34_active(s))
+    {
+        /* faxmodem: no TCF under V.34 (Annex F): CFR at once, as after a
+           good one. ECM is mandatory. */
+        if (!s->error_correcting_mode)
+        {
+            span_log(&s->logging, SPAN_LOG_FLOW, "DCS without ECM under V.34\n");
+            t30_set_status(s, T30_ERR_INCOMPATIBLE);
+            send_dcn(s);
+            return -1;
+        }
+        s->short_train = true;
+        rx_start_page(s);
+        set_phase(s, T30_PHASE_B_TX);
+        set_state(s, T30_STATE_F_CFR);
+        send_cfr_sequence(s, true);
+        return 0;
     }
     if (!(s->iaf & T30_IAF_MODE_NO_TCF))
     {
@@ -4728,7 +4757,10 @@ static void process_rx_control_msg(t30_state_t *s, const uint8_t *msg, int len)
 
 static void queue_phase(t30_state_t *s, int phase)
 {
-    if (s->rx_signal_present)
+    /* faxmodem: under V.34 the control channel is full duplex and never
+       drops its carrier - it idles on flags - so waiting for the far end's
+       signal to go away would be waiting for ever. Turn round at once. */
+    if (s->rx_signal_present  &&  !fm_t30_v34_active(s))
     {
         /* We need to wait for that signal to go away */
         if (s->next_phase != T30_PHASE_IDLE)
@@ -5734,7 +5766,10 @@ static void t30_hdlc_rx_status(void *user_data, int status)
         }
         /* 5.4.3.1 Timer T2 is reset if flag is received. Timer T2A must be started. */
         /* Unstated, but implied, is that timer T4 and T4A are handled the same way. */
-        if (s->timer_t2_t4 > 0)
+        /* faxmodem: under V.34 the control channel idles on flags, so flags
+           say nothing about a frame being on its way; T2 and T4 run on until
+           one arrives. */
+        if (s->timer_t2_t4 > 0  &&  !fm_t30_v34_active(s))
         {
             switch(s->timer_t2_t4_is)
             {
@@ -5980,7 +6015,17 @@ SPAN_DECLARE(void) t30_front_end_status(void *user_data, int status)
         case T30_STATE_D:
             if (send_dcs_sequence(s, false))
             {
-                if ((s->iaf & T30_IAF_MODE_NO_TCF))
+                if (fm_t30_v34_active(s))
+                {
+                    /* faxmodem: no TCF under V.34 (Annex F); straight to
+                       waiting for CFR, as after a TCF. */
+                    s->retries = 0;
+                    s->short_train = true;
+                    set_phase(s, T30_PHASE_B_RX);
+                    timer_t4_start(s);
+                    set_state(s, T30_STATE_D_POST_TCF);
+                }
+                else if ((s->iaf & T30_IAF_MODE_NO_TCF))
                 {
                     /* Skip the trainability test */
                     s->retries = 0;
