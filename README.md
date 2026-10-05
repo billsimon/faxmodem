@@ -422,6 +422,19 @@ loss, transcoding and one-way jitter all look like a bad phone line to a modem.
 **Pages arrive corrupted.** Keep ECM on; with ECM off any lost packet becomes
 speckle. `bad_rows` in the per-page log line tells you how bad the line is.
 
+**A very noisy line never gets going.** spandsp's receivers treat anything
+above -45.5 dBm0 as a carrier, so line noise near that level (it takes an
+unusually bad analog leg; VoIP paths sit far below it) looks like a carrier
+that never drops, and T.30 waits for the end of a frame that never comes.
+Transfers become unreliable from about -50 dBm0 of noise and stop entirely at
+-45. `--advance-timeout` clears such a call; there is no setting that rescues
+it.
+
+**Long-delay calls and echo.** On a call into the telephone network the far
+end's line card can return our own signal a round trip later. faxmodem ignores
+a received frame identical to one it sent in the last few seconds, so this no
+longer ends calls; `own_echoes=` in the `transfer finished` line counts them.
+
 **Nothing in the inbox.** `receive` writes only when a call actually completes
 T.30; a partial transfer is logged as such and the TIFF flagged as incomplete.
 
