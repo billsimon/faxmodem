@@ -2,7 +2,9 @@
 
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
@@ -11,11 +13,42 @@ static fm_log_level_t g_level = FM_LOG_INFO;
 static bool g_json = false;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Writing to stdout can block - docker's log driver falling behind, journald
+ * throttling, a `| jq` that stopped reading - and lines come from the pjmedia
+ * clock thread too, from inside spandsp, holding the fax engine's lock in the
+ * middle of a 20 ms frame. A stall there is a hole in the fax carrier. So a
+ * line from any thread but the main one is formatted and queued, and a logger
+ * thread writes it out; one from the main thread is written at once - after
+ * whatever is queued, so nothing comes out of order. If the queue ever fills,
+ * lines are dropped and counted rather than waited for.
+ *
+ * g_io serialises writing to stdout, and is always taken before g_lock,
+ * which guards the queue and the settings. */
+#define LOG_QUEUE_BYTES (1024 * 1024)
+#define LOG_LINE_MAX 8192
+
+static pthread_mutex_t g_io = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_queued = PTHREAD_COND_INITIALIZER;
+static unsigned char g_queue[LOG_QUEUE_BYTES];
+static size_t g_q_head;
+static size_t g_q_len;
+static unsigned long g_q_dropped;
+static pthread_t g_main;
+static bool g_have_main = false;
+static pthread_t g_writer;
+static bool g_writer_running = false;
+static bool g_writer_stop = false;
+
 static const char *const LEVEL_NAMES[] = {"error", "warn", "info", "debug", "trace"};
 
 void fm_log_init(fm_log_level_t level, bool json)
 {
     pthread_mutex_lock(&g_lock);
+    if (!g_have_main)
+    {
+        g_main = pthread_self();
+        g_have_main = true;
+    }
     g_level = level;
     g_json = json;
     /* Line buffering keeps ordering sane when stdout is a pipe (docker logs,
@@ -118,16 +151,15 @@ static void rtrim(char *s)
         s[--n] = '\0';
 }
 
-static void emit(fm_log_level_t level, const char *component, const char *event, const char *msg)
+/* One finished line, newline included, in whichever format is selected.
+ * Returns its length, truncated to fit. */
+static size_t format_line(char *line, size_t line_len, fm_log_level_t level, const char *component,
+                          const char *event, const char *msg)
 {
     char ts[40];
-
-    if (!fm_log_enabled(level))
-        return;
+    int n;
 
     timestamp(ts, sizeof(ts));
-
-    pthread_mutex_lock(&g_lock);
     if (g_json)
     {
         char emsg[4096];
@@ -138,21 +170,208 @@ static void emit(fm_log_level_t level, const char *component, const char *event,
         if (event != NULL)
         {
             json_escape(event, eevent, sizeof(eevent));
-            printf("{\"ts\":\"%s\",\"level\":\"%s\",\"component\":\"%s\",\"event\":\"%s\",\"msg\":\"%s\"}\n",
-                   ts, fm_log_level_name(level), ecomp, eevent, emsg);
+            n = snprintf(line, line_len,
+                         "{\"ts\":\"%s\",\"level\":\"%s\",\"component\":\"%s\",\"event\":\"%s\",\"msg\":\"%s\"}\n",
+                         ts, fm_log_level_name(level), ecomp, eevent, emsg);
         }
         else
         {
-            printf("{\"ts\":\"%s\",\"level\":\"%s\",\"component\":\"%s\",\"msg\":\"%s\"}\n",
-                   ts, fm_log_level_name(level), ecomp, emsg);
+            n = snprintf(line, line_len, "{\"ts\":\"%s\",\"level\":\"%s\",\"component\":\"%s\",\"msg\":\"%s\"}\n",
+                         ts, fm_log_level_name(level), ecomp, emsg);
         }
     }
     else
     {
-        printf("%s %-5s [%s] %s\n", ts, fm_log_level_name(level), component ? component : "faxmodem", msg);
+        n = snprintf(line, line_len, "%s %-5s [%s] %s\n", ts, fm_log_level_name(level),
+                     component ? component : "faxmodem", msg);
     }
+    if (n < 0)
+        return 0;
+    if ((size_t) n >= line_len)
+    {
+        n = (int) line_len - 1;
+        line[n - 1] = '\n';
+    }
+    return (size_t) n;
+}
+
+/* ------------------------------------------------------------ the queue */
+
+/* Callers hold g_lock. */
+static void q_copy_in(const void *src, size_t n)
+{
+    size_t tail = (g_q_head + g_q_len) % LOG_QUEUE_BYTES;
+    size_t first = LOG_QUEUE_BYTES - tail;
+
+    if (first > n)
+        first = n;
+    memcpy(g_queue + tail, src, first);
+    memcpy(g_queue, (const unsigned char *) src + first, n - first);
+    g_q_len += n;
+}
+
+static void q_copy_out(void *dst, size_t n)
+{
+    size_t first = LOG_QUEUE_BYTES - g_q_head;
+
+    if (first > n)
+        first = n;
+    memcpy(dst, g_queue + g_q_head, first);
+    memcpy((unsigned char *) dst + first, g_queue, n - first);
+    g_q_head = (g_q_head + n) % LOG_QUEUE_BYTES;
+    g_q_len -= n;
+}
+
+/* A record is its length, then the line. Callers hold g_lock. */
+static void q_push(const char *line, size_t len)
+{
+    uint32_t n = (uint32_t) len;
+
+    if (g_q_len + sizeof(n) + len > LOG_QUEUE_BYTES)
+    {
+        g_q_dropped++;
+        return;
+    }
+    q_copy_in(&n, sizeof(n));
+    q_copy_in(line, len);
+}
+
+static size_t q_pop(char *out)
+{
+    uint32_t n;
+
+    if (g_q_len == 0)
+        return 0;
+    q_copy_out(&n, sizeof(n));
+    q_copy_out(out, n);
+    return n;
+}
+
+/* Everything queued, written out. Callers hold g_io, and not g_lock. */
+static void drain_locked_io(void)
+{
+    static char line[LOG_LINE_MAX];
+
+    for (;;)
+    {
+        unsigned long dropped;
+        size_t n;
+
+        pthread_mutex_lock(&g_lock);
+        n = q_pop(line);
+        dropped = g_q_dropped;
+        g_q_dropped = 0;
+        pthread_mutex_unlock(&g_lock);
+        if (dropped > 0)
+        {
+            char msg[96];
+            char note[512];
+            size_t len;
+
+            snprintf(msg, sizeof(msg), "%lu log lines dropped: stdout could not keep up", dropped);
+            len = format_line(note, sizeof(note), FM_LOG_WARN, "log", NULL, msg);
+            fwrite(note, 1, len, stdout);
+        }
+        if (n == 0)
+            break;
+        fwrite(line, 1, n, stdout);
+    }
+}
+
+static void *writer_main(void *arg)
+{
+    (void) arg;
+    for (;;)
+    {
+        bool stop;
+
+        pthread_mutex_lock(&g_lock);
+        while (g_q_len == 0 && g_q_dropped == 0 && !g_writer_stop)
+            pthread_cond_wait(&g_queued, &g_lock);
+        stop = g_writer_stop && g_q_len == 0 && g_q_dropped == 0;
+        pthread_mutex_unlock(&g_lock);
+        if (stop)
+            break;
+
+        pthread_mutex_lock(&g_io);
+        drain_locked_io();
+        fflush(stdout);
+        pthread_mutex_unlock(&g_io);
+    }
+    return NULL;
+}
+
+/* Everything queued so far, written out now. Runs at exit, so the last lines
+ * of a run - the call result, the exit code - are never left in the queue. */
+static void log_flush(void)
+{
+    pthread_mutex_lock(&g_io);
+    drain_locked_io();
     fflush(stdout);
+    pthread_mutex_unlock(&g_io);
+}
+
+void fm_log_close(void)
+{
+    bool join;
+
+    pthread_mutex_lock(&g_lock);
+    join = g_writer_running;
+    g_writer_stop = true;
+    pthread_cond_signal(&g_queued);
     pthread_mutex_unlock(&g_lock);
+    if (join)
+        pthread_join(g_writer, NULL);
+    log_flush();
+}
+
+static void emit(fm_log_level_t level, const char *component, const char *event, const char *msg)
+{
+    /* Per thread rather than on the stack, which in pjsip's threads is not
+     * ours to size. */
+    static __thread char line[LOG_LINE_MAX];
+    size_t n;
+
+    if (!fm_log_enabled(level))
+        return;
+
+    n = format_line(line, sizeof(line), level, component, event, msg);
+    if (n == 0)
+        return;
+
+    if (!g_have_main || pthread_equal(pthread_self(), g_main))
+    {
+        pthread_mutex_lock(&g_io);
+        drain_locked_io();
+        fwrite(line, 1, n, stdout);
+        fflush(stdout);
+        pthread_mutex_unlock(&g_io);
+        return;
+    }
+
+    pthread_mutex_lock(&g_lock);
+    if (!g_writer_running && !g_writer_stop)
+    {
+        if (pthread_create(&g_writer, NULL, writer_main, NULL) == 0)
+        {
+            g_writer_running = true;
+            atexit(log_flush);
+        }
+    }
+    if (g_writer_running && !g_writer_stop)
+    {
+        q_push(line, n);
+        pthread_cond_signal(&g_queued);
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    /* No thread to hand it to: write it ourselves, as before. */
+    pthread_mutex_lock(&g_io);
+    fwrite(line, 1, n, stdout);
+    fflush(stdout);
+    pthread_mutex_unlock(&g_io);
 }
 
 void fm_logf(fm_log_level_t level, const char *component, const char *fmt, ...)

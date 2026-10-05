@@ -417,9 +417,13 @@ int fm_spool_run(const fm_config_t *cfg, volatile sig_atomic_t *stop)
 
         fm_sip_poll_inbound();
 
-        if (!fm_sip_call_active() && next_job(&s, cfg, &job))
+        /* The line is held before the job is claimed: an inbound call
+         * arriving in between would otherwise take it, and the job would
+         * spend an attempt finding the line busy. */
+        if (!fm_sip_call_active() && next_job(&s, cfg, &job) && fm_sip_reserve_line())
         {
             run_job(&s, &job);
+            fm_sip_release_line();
             continue; /* drain the queue before sleeping again */
         }
 

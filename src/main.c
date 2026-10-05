@@ -167,5 +167,6 @@ int main(int argc, char *argv[])
     }
 
     FM_INFO("faxmodem", "exit %d", rc);
+    fm_log_close();
     return rc;
 }

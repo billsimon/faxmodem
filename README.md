@@ -151,6 +151,12 @@ same name everywhere: the flag `--station-id` is `FAXMODEM_STATION_ID` in the
 environment and `station-id = ...` in a config file. `faxmodem help` lists them
 all; see [`examples/faxmodem.conf`](examples/faxmodem.conf).
 
+In a config file a `#` after whitespace starts a trailing comment
+(`media-timeout = 20  # seconds`); a `#` with no space before it, as in a
+password like `abc#123`, is part of the value. A value that must contain ` #`
+belongs in the environment or on the command line instead. Spool job files take
+every value verbatim, so a `header` like `Acme #42` survives the queue.
+
 The settings that matter most in practice:
 
 | Flag | Default | Notes |
@@ -178,6 +184,13 @@ The settings that matter most in practice:
 `--log-level debug` also turns up pjsip (full SIP message traces) and spandsp
 (T.30 frame-by-frame) logging; `--pjsip-log-level` and `--spandsp-log-level`
 override each independently.
+
+Most T.30 logging happens on the media thread, in the middle of a 20 ms audio
+frame, so lines from pjsip's and pjmedia's threads are queued and written by a
+logger thread rather than in place: a stdout that stops accepting writes (a log
+driver falling behind, a `| jq` that stopped reading) cannot stall the fax
+carrier. If the 1 MB queue fills, lines are dropped and a
+`N log lines dropped: stdout could not keep up` warning says how many.
 
 ### Registration
 
@@ -320,6 +333,16 @@ gs -q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=tiffg4 -r204x196 -g1728x2156 \
 fraction of a second — it proves spandsp, your TIFF and the build, and never
 touches the network.
 
+`FAXMODEM_SELFTEST_LINE` puts a worse line between the two engines, for what a
+perfect one cannot exercise: `delay=150` (ms, each way), `echo=-20` (each
+end's own signal returned that many dB down, a round trip later, as a far-end
+hybrid does), `noise=-50` (white noise, dBm0), and `ulaw` or `alaw` (G.711).
+It is a test hook, not an option:
+
+```sh
+FAXMODEM_SELFTEST_LINE="delay=150,echo=-20,ulaw" faxmodem selftest invoice.tif --output-dir /tmp/out
+```
+
 `scripts/loopback-test.sh` goes further: it starts a receiver on 127.0.0.1,
 sends it a fax from a second process over real SIP and real RTP, and compares
 page counts. That exercises everything except your carrier.
@@ -387,7 +410,7 @@ T.30; a partial transfer is logged as such and the TIFF flagged as incomplete.
 ```
 src/main.c        command dispatch, signals
 src/config.c      flags, environment, config files (one option table drives all three)
-src/log.c         stdout logging; pjsip and spandsp are routed through it
+src/log.c         stdout logging, queued off the media thread; pjsip and spandsp are routed through it
 src/fax.c         spandsp T.30 engine, phase B/D/E handlers, in-memory selftest
 src/sip.c         pjsua setup, registration, calls, and the fax pjmedia port
 src/spool.c       the queue: claim, send, retry, result files

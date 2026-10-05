@@ -4,6 +4,7 @@
 #include "faxmodem/util.h"
 
 #include <inttypes.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -377,16 +378,155 @@ int fm_fax_exit_code(int t30_result)
 
 /* ------------------------------------------------------------------------- */
 
-static void pump(fm_fax_t *from, fm_fax_t *to, int16_t *buf, int chunk)
-{
-    int n = fm_fax_tx(from, buf, chunk);
+/* The line between the two engines. By default a perfect one - each end
+ * hears exactly what the other sent, in the same 20 ms frame - which is what
+ * tells a T.30 problem from a line problem.
+ *
+ * FAXMODEM_SELFTEST_LINE describes a worse one, for the things a perfect line
+ * cannot exercise: "delay=150,echo=-20,noise=-45,ulaw". delay is one way, in
+ * ms, as jitter buffers and a network would make it - T.30's command/response
+ * timers have to survive it; echo puts each end's own signal back into its
+ * receiver that many dB down, a whole round trip later, the way the far end's
+ * hybrid does on a call into the telephone network - an engine must not take
+ * its own echoed V.21 for the far end; noise is white noise in dBm0; ulaw or
+ * alaw passes everything through G.711, as every real call does. A test hook,
+ * not an option. */
+#define SELFTEST_LINE_MAX (SELFTEST_CHUNK * 128) /* 2.56 s of each direction */
 
-    if (n < chunk)
+typedef struct
+{
+    int delay;                /* one way, samples */
+    int echo_delay;           /* samples */
+    float echo_gain;          /* 0 = no echo */
+    int g711;                 /* 0 linear, 'u' or 'a' */
+    awgn_state_t *noise;
+    int16_t hist[2][SELFTEST_LINE_MAX];
+    long pos;
+} selftest_line_t;
+
+static bool selftest_line_init(selftest_line_t *ln, char *desc, size_t desc_len)
+{
+    const char *spec = getenv("FAXMODEM_SELFTEST_LINE");
+    char buf[256];
+    char *tok;
+    char *save = NULL;
+    double delay_ms = 0.0;
+    double echo_db = 0.0;
+    double noise_db = 0.0;
+    bool echo = false;
+
+    memset(ln, 0, sizeof(*ln));
+    snprintf(desc, desc_len, "perfect");
+    if (spec == NULL || *spec == '\0')
+        return true;
+
+    snprintf(buf, sizeof(buf), "%s", spec);
+    for (tok = strtok_r(buf, ", ", &save); tok != NULL; tok = strtok_r(NULL, ", ", &save))
     {
-        memset(buf + n, 0, (size_t) (chunk - n) * sizeof(int16_t));
-        n = chunk;
+        if (strncmp(tok, "delay=", 6) == 0)
+            delay_ms = atof(tok + 6);
+        else if (strncmp(tok, "echo=", 5) == 0)
+        {
+            echo_db = atof(tok + 5);
+            echo = true;
+        }
+        else if (strncmp(tok, "noise=", 6) == 0)
+            noise_db = atof(tok + 6);
+        else if (strcmp(tok, "ulaw") == 0)
+            ln->g711 = 'u';
+        else if (strcmp(tok, "alaw") == 0)
+            ln->g711 = 'a';
+        else
+        {
+            FM_ERROR("selftest", "FAXMODEM_SELFTEST_LINE: '%s' is not delay=, echo=, noise=, ulaw or alaw", tok);
+            return false;
+        }
     }
-    fm_fax_rx(to, buf, n);
+    if (delay_ms < 0.0 || echo_db > 0.0 || noise_db > 0.0)
+    {
+        FM_ERROR("selftest", "FAXMODEM_SELFTEST_LINE: delay must be >= 0, echo and noise <= 0 dB");
+        return false;
+    }
+    ln->delay = (int) (delay_ms * 8000.0 / 1000.0);
+    /* Back from the far end's line card: twice the one-way path, plus a
+     * millisecond of local loop. */
+    ln->echo_delay = 2 * ln->delay + 8;
+    if (ln->echo_delay >= SELFTEST_LINE_MAX - SELFTEST_CHUNK)
+    {
+        FM_ERROR("selftest", "FAXMODEM_SELFTEST_LINE: a %.0f ms delay is longer than the selftest's line can hold",
+                 delay_ms);
+        return false;
+    }
+    if (echo)
+        ln->echo_gain = powf(10.0f, (float) echo_db / 20.0f);
+    if (noise_db < 0.0)
+    {
+        ln->noise = awgn_init_dbm0(NULL, 1234567, (float) noise_db);
+        if (ln->noise == NULL)
+        {
+            FM_ERROR("selftest", "could not create the noise generator");
+            return false;
+        }
+    }
+    snprintf(desc, desc_len, "delay %.0f ms each way, echo %s, noise %s, %s", delay_ms, echo ? "on" : "none",
+             ln->noise ? "on" : "none",
+             ln->g711 == 'u' ? "G.711 mu-law" : ln->g711 == 'a' ? "G.711 A-law" : "linear");
+    if (echo || ln->noise)
+        snprintf(desc + strlen(desc), desc_len - strlen(desc), " (echo %.0f dB, noise %.0f dBm0)", echo_db,
+                 noise_db);
+    return true;
+}
+
+static void selftest_line_free(selftest_line_t *ln)
+{
+    if (ln->noise != NULL)
+        awgn_free(ln->noise);
+    ln->noise = NULL;
+}
+
+/* One 20 ms frame each way. Both ends transmit before either receives, which
+ * is the order pjmedia's conference bridge calls a port in. */
+static void selftest_line_run(selftest_line_t *ln, fm_fax_t *caller, fm_fax_t *answerer)
+{
+    int16_t out[2][SELFTEST_CHUNK];
+    int16_t in[2][SELFTEST_CHUNK];
+    fm_fax_t *end[2] = {caller, answerer};
+
+    for (int e = 0; e < 2; e++)
+    {
+        int n = fm_fax_tx(end[e], out[e], SELFTEST_CHUNK);
+
+        if (n < SELFTEST_CHUNK)
+            memset(out[e] + n, 0, (size_t) (SELFTEST_CHUNK - n) * sizeof(int16_t));
+    }
+    for (int i = 0; i < SELFTEST_CHUNK; i++)
+    {
+        long t = ln->pos + i;
+
+        ln->hist[0][t % SELFTEST_LINE_MAX] = out[0][i];
+        ln->hist[1][t % SELFTEST_LINE_MAX] = out[1][i];
+        for (int e = 0; e < 2; e++)
+        {
+            float x = (t >= ln->delay) ? ln->hist[1 - e][(t - ln->delay) % SELFTEST_LINE_MAX] : 0.0f;
+
+            if (ln->echo_gain > 0.0f && t >= ln->echo_delay)
+                x += ln->echo_gain * ln->hist[e][(t - ln->echo_delay) % SELFTEST_LINE_MAX];
+            if (ln->noise != NULL)
+                x += awgn(ln->noise);
+            if (x > 32767.0f)
+                x = 32767.0f;
+            else if (x < -32768.0f)
+                x = -32768.0f;
+            in[e][i] = (int16_t) lrintf(x);
+            if (ln->g711 == 'u')
+                in[e][i] = ulaw_to_linear(linear_to_ulaw(in[e][i]));
+            else if (ln->g711 == 'a')
+                in[e][i] = alaw_to_linear(linear_to_alaw(in[e][i]));
+        }
+    }
+    ln->pos += SELFTEST_CHUNK;
+    fm_fax_rx(answerer, in[1], SELFTEST_CHUNK);
+    fm_fax_rx(caller, in[0], SELFTEST_CHUNK);
 }
 
 int fm_fax_selftest(const fm_config_t *cfg)
@@ -401,7 +541,9 @@ int fm_fax_selftest(const fm_config_t *cfg)
     char err[512];
     char out_path[FM_STR_MAX + 64];
     char stem[128];
-    int16_t buf[SELFTEST_CHUNK];
+    char line_desc[160];
+    /* 80 KB of history: static rather than on the stack. */
+    static selftest_line_t line;
     int rc = FM_EXIT_OK;
     int64_t started;
     long iterations = 0;
@@ -419,6 +561,8 @@ int fm_fax_selftest(const fm_config_t *cfg)
         FM_ERROR("selftest", "%s", err);
         return FM_EXIT_CONFIG;
     }
+    if (!selftest_line_init(&line, line_desc, sizeof(line_desc)))
+        return FM_EXIT_CONFIG;
     fm_basename_stem(cfg->file, stem, sizeof(stem));
     fm_sanitise_filename(stem);
     snprintf(out_path, sizeof(out_path), "%s/selftest-%s.tif", cfg->output_dir, stem);
@@ -448,17 +592,18 @@ int fm_fax_selftest(const fm_config_t *cfg)
     {
         fm_fax_destroy(tx);
         fm_fax_destroy(rx);
+        selftest_line_free(&line);
         return FM_EXIT_INTERNAL;
     }
 
-    FM_INFO("selftest", "looping two T.30 engines back to back, writing %s", out_path);
+    FM_INFO("selftest", "looping two T.30 engines back to back over a %s line, writing %s", line_desc,
+            out_path);
     started = fm_now_ms();
 
     while (iterations < max_iterations)
     {
         iterations++;
-        pump(tx, rx, buf, SELFTEST_CHUNK);
-        pump(rx, tx, buf, SELFTEST_CHUNK);
+        selftest_line_run(&line, tx, rx);
         if (fm_fax_completed(tx) && fm_fax_completed(rx))
             break;
     }
@@ -485,5 +630,6 @@ int fm_fax_selftest(const fm_config_t *cfg)
 
     fm_fax_destroy(tx);
     fm_fax_destroy(rx);
+    selftest_line_free(&line);
     return rc;
 }

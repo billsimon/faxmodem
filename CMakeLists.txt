@@ -72,6 +72,11 @@ if(OPENSSL_FOUND)
   target_link_libraries(faxmodem PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 endif()
 
+# powf/lrintf, for the selftest's simulated line. Part of libc on macOS.
+if(UNIX AND NOT APPLE)
+  target_link_libraries(faxmodem PRIVATE m)
+endif()
+
 target_compile_options(faxmodem PRIVATE
   -Wall -Wextra -Wno-unused-parameter -Wshadow
   $<$<BOOL:${FAXMODEM_WERROR}>:-Werror>

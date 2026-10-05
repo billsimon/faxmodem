@@ -304,8 +304,29 @@ static char *trim(char *s)
     return s;
 }
 
-/* Shared by the config file and the spool job files: one key=value per line. */
-bool fm_config_read_kv(fm_config_t *cfg, const char *path, char *err, size_t err_len)
+/* "media-timeout = 20   # seconds": a # after whitespace, with something
+ * already in front of it, starts a comment. Only then - so that a password
+ * like `abc#123` still means what it says. */
+static void strip_comment(char *value)
+{
+    if (*value == '\0')
+        return;
+    for (char *p = value + 1; *p != '\0'; p++)
+    {
+        if (*p == '#' && (p[-1] == ' ' || p[-1] == '\t'))
+        {
+            *p = '\0';
+            trim(value);
+            return;
+        }
+    }
+}
+
+/* Shared by the config file and the spool job files: one key=value per line.
+ * Only a config file, which people write by hand, gets trailing comments: a
+ * job file carries values verbatim, and a header like "Acme #42" has to come
+ * back out of it intact. */
+static bool read_kv(fm_config_t *cfg, const char *path, bool trailing_comments, char *err, size_t err_len)
 {
     FILE *f = fopen(path, "r");
     char line[1024];
@@ -336,6 +357,8 @@ bool fm_config_read_kv(fm_config_t *cfg, const char *path, char *err, size_t err
         }
         *eq = '\0';
         value = trim(eq + 1);
+        if (trailing_comments)
+            strip_comment(value);
         key = trim(key);
         /* Tolerate leading dashes so a config file can be copy-pasted flags. */
         while (*key == '-')
@@ -353,9 +376,14 @@ bool fm_config_read_kv(fm_config_t *cfg, const char *path, char *err, size_t err
     return true;
 }
 
+bool fm_config_read_kv(fm_config_t *cfg, const char *path, char *err, size_t err_len)
+{
+    return read_kv(cfg, path, false, err, err_len);
+}
+
 bool fm_config_apply_file(fm_config_t *cfg, const char *path, char *err, size_t err_len)
 {
-    return fm_config_read_kv(cfg, path, err, err_len);
+    return read_kv(cfg, path, true, err, err_len);
 }
 
 static fm_command_t command_from_string(const char *s)

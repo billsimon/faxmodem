@@ -113,7 +113,9 @@ void fm_config_defaults(fm_config_t *cfg);
 void fm_config_apply_env(fm_config_t *cfg);
 
 /* Reads a key=value file (# comments, blank lines ignored). Returns false and
- * fills err on a syntax error or unknown key. */
+ * fills err on a syntax error or unknown key. A config file also allows a
+ * trailing comment after whitespace (`media-timeout = 20  # seconds`); a spool
+ * job file, read with fm_config_read_kv(), takes every value verbatim. */
 bool fm_config_apply_file(fm_config_t *cfg, const char *path, char *err, size_t err_len);
 bool fm_config_read_kv(fm_config_t *cfg, const char *path, char *err, size_t err_len);
 

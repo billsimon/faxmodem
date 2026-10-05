@@ -27,6 +27,7 @@
 typedef struct
 {
     pjmedia_port base;
+    pj_pool_t *pool;            /* the port's own; the port lives in it */
     fm_fax_t *fax;
     unsigned samples_per_frame;
     pj_timestamp ts;
@@ -35,8 +36,7 @@ typedef struct
 typedef struct
 {
     pjsua_call_id call_id;
-    fm_fax_t *fax;
-    pj_pool_t *pool;
+    fm_fax_t *fax;              /* owned by port; valid until call_destroy() */
     fm_fax_port_t *port;
     pjsua_conf_port_id slot;
     bool media_active;
@@ -57,6 +57,21 @@ typedef struct
     const char *stall_reason;   /* set when a watchdog gives up on the call */
 } fm_call_t;
 
+/* Threads. pjsua calls the on_* callbacks on its own worker threads, while
+ * the main thread places, polls and clears calls; everything both of them
+ * touch - the registration result, whether inbound is enabled, who holds the
+ * line, g.active and the fields of the call it points to that the callbacks
+ * write - is under g.lock. Two rules keep that deadlock-free whatever locks
+ * pjsua holds when it calls us: no pjsua function is called with g.lock held,
+ * and a call context is only freed by the main thread, after g.active stops
+ * pointing at it, under the lock - so a callback that finds its context still
+ * active holds it alive until it lets go.
+ *
+ * The line. One call at a time, and the line is held from the moment a call
+ * is decided on - before its context is built, which takes a while - until
+ * that context is freed. Otherwise an inbound call and an outbound one could
+ * both see the line free and both proceed, and one context would be orphaned:
+ * never polled, never timed out, never freed. */
 static struct
 {
     bool started;
@@ -68,6 +83,8 @@ static struct
     bool reg_ok;
     int reg_status;
     bool inbound_enabled;
+    bool line_held;         /* a call has the line, or is being set up to */
+    bool outbound_held;     /* ...and it is the main thread's, for sending */
     fm_call_t *active;      /* one call at a time; inbound is rejected while busy */
     unsigned call_counter;
 } g = {.acc_id = PJSUA_INVALID_ID, .lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER};
@@ -82,10 +99,70 @@ static pj_str_t pjs(const char *s)
     return r;
 }
 
-static void signal_change(void)
+/* The main thread may be waiting in wait_change_ms() for something to
+ * change. Callers hold g.lock. */
+static void signal_change_locked(void)
+{
+    pthread_cond_broadcast(&g.cond);
+}
+
+/* The context of a pjsua call, locked, if it is still the call we are
+ * running - or NULL, unlocked, if it is not: not ours, or already cleared.
+ * The user data is only compared, never followed, until it is known to be
+ * g.active, so a stale pointer to a freed context is harmless. */
+static fm_call_t *call_lock(pjsua_call_id call_id)
+{
+    fm_call_t *c = pjsua_call_get_user_data(call_id);
+
+    pthread_mutex_lock(&g.lock);
+    if (c == NULL || c != g.active)
+    {
+        pthread_mutex_unlock(&g.lock);
+        return NULL;
+    }
+    return c;
+}
+
+static void call_unlock(void)
+{
+    pthread_mutex_unlock(&g.lock);
+}
+
+/* For the main thread, which owns c: the fields the callbacks write. */
+static bool call_disconnected(fm_call_t *c)
+{
+    bool v;
+
+    pthread_mutex_lock(&g.lock);
+    v = c->disconnected;
+    pthread_mutex_unlock(&g.lock);
+    return v;
+}
+
+/* Takes the line for an outbound call, unless the main thread already holds
+ * it for one. */
+static bool line_take_outbound(void)
+{
+    bool ok = true;
+
+    pthread_mutex_lock(&g.lock);
+    if (!g.outbound_held)
+    {
+        if (g.line_held)
+            ok = false;
+        else
+            g.line_held = g.outbound_held = true;
+    }
+    pthread_mutex_unlock(&g.lock);
+    return ok;
+}
+
+static void line_release(void)
 {
     pthread_mutex_lock(&g.lock);
-    pthread_cond_broadcast(&g.cond);
+    g.line_held = false;
+    g.outbound_held = false;
+    signal_change_locked();
     pthread_mutex_unlock(&g.lock);
 }
 
@@ -141,9 +218,20 @@ static pj_status_t fax_port_put_frame(pjmedia_port *port, pjmedia_frame *frame)
     return PJ_SUCCESS;
 }
 
+/* The conference bridge removes a port asynchronously, on its clock thread,
+ * and may still call get_frame()/put_frame() after pjsua_conf_remove_port()
+ * has returned. So the port owns its pool and the fax engine, and the port's
+ * group lock holds them until the bridge and call_destroy() have both let go;
+ * this runs then, on whichever thread let go last. */
 static pj_status_t fax_port_on_destroy(pjmedia_port *port)
 {
-    (void) port;
+    fm_fax_port_t *p = (fm_fax_port_t *) port;
+    pj_pool_t *pool = p->pool;
+
+    FM_DEBUG("sip", "fax media port released by the bridge");
+    fm_fax_destroy(p->fax);
+    p->fax = NULL;
+    pj_pool_release(pool); /* p lives in it */
     return PJ_SUCCESS;
 }
 
@@ -171,6 +259,7 @@ static fm_fax_port_t *create_fax_port(pj_pool_t *pool, fm_fax_t *fax)
     p->base.put_frame = &fax_port_put_frame;
     p->base.on_destroy = &fax_port_on_destroy;
     p->samples_per_frame = spf;
+    p->pool = pool;
     p->fax = fax;
     return p;
 }
@@ -182,6 +271,7 @@ static fm_call_t *call_create(const fm_config_t *cfg, bool inbound, const char *
 {
     fm_call_t *c = calloc(1, sizeof(*c));
     fm_fax_params_t params;
+    pj_pool_t *pool;
     pj_status_t status;
 
     if (c == NULL)
@@ -220,29 +310,39 @@ static fm_call_t *call_create(const fm_config_t *cfg, bool inbound, const char *
         return NULL;
     }
 
-    c->pool = pjsua_pool_create("faxcall", 1024, 1024);
-    if (c->pool == NULL)
+    pool = pjsua_pool_create("faxcall", 1024, 1024);
+    if (pool == NULL)
     {
         fm_fax_destroy(c->fax);
         free(c);
         return NULL;
     }
 
-    c->port = create_fax_port(c->pool, c->fax);
+    c->port = create_fax_port(pool, c->fax);
     if (c->port == NULL)
     {
-        pj_pool_release(c->pool);
+        pj_pool_release(pool);
         fm_fax_destroy(c->fax);
         free(c);
         return NULL;
     }
 
-    status = pjsua_conf_add_port(c->pool, &c->port->base, &c->slot);
+    /* From here the port owns the pool and the fax engine; see
+     * fax_port_on_destroy(). The group lock starts with our reference. */
+    status = pjmedia_port_init_grp_lock(&c->port->base, pool, NULL);
+    if (status != PJ_SUCCESS)
+    {
+        log_pj_error("pjmedia_port_init_grp_lock", status);
+        fax_port_on_destroy(&c->port->base);
+        free(c);
+        return NULL;
+    }
+
+    status = pjsua_conf_add_port(pool, &c->port->base, &c->slot);
     if (status != PJ_SUCCESS)
     {
         log_pj_error("pjsua_conf_add_port", status);
-        pj_pool_release(c->pool);
-        fm_fax_destroy(c->fax);
+        pjmedia_port_destroy(&c->port->base);
         free(c);
         return NULL;
     }
@@ -250,16 +350,36 @@ static fm_call_t *call_create(const fm_config_t *cfg, bool inbound, const char *
     return c;
 }
 
+/* The caller has already taken c out of g.active, under the lock. */
 static void call_destroy(fm_call_t *c)
 {
     if (c == NULL)
         return;
+    /* pjsua may still hold the call - a BYE the far end never answered keeps
+     * it alive for another half a minute - and would hand this pointer to the
+     * next callback. call_lock() would refuse it, but there is no reason to
+     * leave a dangling pointer lying around. */
+    if (c->call_id != PJSUA_INVALID_ID && pjsua_call_is_active(c->call_id) &&
+        pjsua_call_get_user_data(c->call_id) == c)
+        pjsua_call_set_user_data(c->call_id, NULL);
     if (c->slot != PJSUA_INVALID_ID)
         pjsua_conf_remove_port(c->slot);
-    if (c->pool != NULL)
-        pj_pool_release(c->pool);
-    fm_fax_destroy(c->fax);
+    /* Our reference; the pool and fax engine go when the bridge's does. */
+    if (c->port != NULL)
+        pjmedia_port_destroy(&c->port->base);
     free(c);
+}
+
+/* The end of a call, on the main thread: out of g.active first, so that from
+ * here no callback will touch it; then freed; then the line is free. */
+static void call_release(fm_call_t *c)
+{
+    pthread_mutex_lock(&g.lock);
+    if (g.active == c)
+        g.active = NULL;
+    pthread_mutex_unlock(&g.lock);
+    call_destroy(c);
+    line_release();
 }
 
 static void call_fill_result(fm_call_t *c, fm_call_result_t *result)
@@ -269,9 +389,11 @@ static void call_fill_result(fm_call_t *c, fm_call_result_t *result)
     memset(result, 0, sizeof(*result));
     fm_fax_status(c->fax, &st);
 
+    pthread_mutex_lock(&g.lock);
     result->connected = c->media_active;
     result->sip_status = c->last_status;
     snprintf(result->sip_reason, sizeof(result->sip_reason), "%s", c->last_reason);
+    pthread_mutex_unlock(&g.lock);
     result->t30_result = st.completed ? st.result : -1;
     snprintf(result->t30_text, sizeof(result->t30_text), "%s",
              st.result_text ? st.result_text : "not started");
@@ -293,19 +415,29 @@ static bool call_stalled(fm_call_t *c)
 {
     pjsua_stream_stat stat;
     int64_t now = fm_now_ms();
+    bool live;
 
-    if (!c->media_active || c->disconnected)
+    pthread_mutex_lock(&g.lock);
+    live = c->media_active && !c->disconnected;
+    pthread_mutex_unlock(&g.lock);
+    if (!live)
         return false;
 
     if (c->media_timeout_s > 0 &&
         pjsua_call_get_stream_stat(c->call_id, 0, &stat) == PJ_SUCCESS)
     {
+        int64_t since;
+
+        pthread_mutex_lock(&g.lock);
         if (stat.rtcp.rx.pkt != c->last_rx_pkts)
         {
             c->last_rx_pkts = stat.rtcp.rx.pkt;
             c->last_rx_change_ms = now;
         }
-        else if (now - c->last_rx_change_ms > (int64_t) c->media_timeout_s * 1000)
+        since = now - c->last_rx_change_ms;
+        pthread_mutex_unlock(&g.lock);
+
+        if (since > (int64_t) c->media_timeout_s * 1000)
         {
             FM_ERROR("sip", "no RTP from the far end for %ds on call %d (tag=%s, %u packets received in "
                             "total) - check the media path and that the negotiated RTP port is reachable",
@@ -350,7 +482,7 @@ static bool call_stalled(fm_call_t *c)
 
 static void on_call_state(pjsua_call_id call_id, pjsip_event *e)
 {
-    fm_call_t *c = pjsua_call_get_user_data(call_id);
+    fm_call_t *c;
     pjsua_call_info ci;
 
     (void) e;
@@ -360,38 +492,52 @@ static void on_call_state(pjsua_call_id call_id, pjsip_event *e)
     FM_INFO("sip", "call %d state %.*s (%d %.*s)", (int) call_id, (int) ci.state_text.slen, ci.state_text.ptr,
             ci.last_status, (int) ci.last_status_text.slen, ci.last_status_text.ptr);
 
+    c = call_lock(call_id);
     if (c == NULL)
         return;
 
     c->last_status = ci.last_status;
     snprintf(c->last_reason, sizeof(c->last_reason), "%.*s", (int) ci.last_status_text.slen,
              ci.last_status_text.ptr);
-
     if (ci.state == PJSIP_INV_STATE_DISCONNECTED)
-    {
         c->disconnected = true;
-        pjsua_call_set_user_data(call_id, NULL);
-        signal_change();
-    }
+    signal_change_locked();
+    call_unlock();
 }
 
 static void on_call_media_state(pjsua_call_id call_id)
 {
-    fm_call_t *c = pjsua_call_get_user_data(call_id);
+    fm_call_t *c;
     pjsua_call_info ci;
+    pjsua_conf_port_id slot;
+    char tag[sizeof(c->tag)];
 
-    if (c == NULL || pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS)
+    if (pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS)
         return;
 
     if (ci.media_status == PJSUA_CALL_MEDIA_ACTIVE)
     {
         pjmedia_transport_info tp_info;
 
-        pjsua_conf_connect(ci.conf_slot, c->slot);
-        pjsua_conf_connect(c->slot, ci.conf_slot);
+        c = call_lock(call_id);
+        if (c == NULL)
+            return;
+        slot = c->slot;
+        snprintf(tag, sizeof(tag), "%s", c->tag);
+        call_unlock();
+
+        /* Not under the lock: see the comment on g. */
+        pjsua_conf_connect(ci.conf_slot, slot);
+        pjsua_conf_connect(slot, ci.conf_slot);
+
+        c = call_lock(call_id);
+        if (c == NULL)
+            return;
         c->media_active = true;
         /* The RTP watchdog only starts counting once there is media to wait for. */
         c->last_rx_change_ms = fm_now_ms();
+        signal_change_locked();
+        call_unlock();
 
         pjmedia_transport_info_init(&tp_info);
         if (pjsua_call_get_med_transport_info(call_id, 0, &tp_info) == PJ_SUCCESS)
@@ -399,13 +545,12 @@ static void on_call_media_state(pjsua_call_id call_id)
             char addr[PJ_INET6_ADDRSTRLEN + 10];
             pj_sockaddr_print(&tp_info.sock_info.rtp_addr_name, addr, sizeof(addr), 3);
             FM_INFO("sip", "media active on call %d, modem connected (tag=%s, local RTP %s)",
-                    (int) call_id, c->tag, addr);
+                    (int) call_id, tag, addr);
         }
         else
         {
-            FM_INFO("sip", "media active on call %d, modem connected (tag=%s)", (int) call_id, c->tag);
+            FM_INFO("sip", "media active on call %d, modem connected (tag=%s)", (int) call_id, tag);
         }
-        signal_change();
     }
     else
     {
@@ -422,6 +567,7 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     char stamp[32];
     char from[160];
     char tag[64];
+    unsigned n;
 
     (void) acc_id;
     (void) rdata;
@@ -433,21 +579,29 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     }
     snprintf(from, sizeof(from), "%.*s", (int) ci.remote_info.slen, ci.remote_info.ptr);
 
+    /* Take the line, under the lock, before building anything: an outbound
+     * fax being set up on the main thread must not get it too. */
+    pthread_mutex_lock(&g.lock);
     if (!g.inbound_enabled)
     {
+        pthread_mutex_unlock(&g.lock);
         FM_INFO("sip", "rejecting inbound call from %s: not accepting calls", from);
         pjsua_call_hangup(call_id, PJSIP_SC_NOT_ACCEPTABLE_HERE, NULL, NULL);
         return;
     }
-    if (g.active != NULL)
+    if (g.line_held)
     {
+        pthread_mutex_unlock(&g.lock);
         FM_WARN("sip", "rejecting inbound call from %s: another fax is in progress", from);
         pjsua_call_hangup(call_id, PJSIP_SC_BUSY_HERE, NULL, NULL);
         return;
     }
+    g.line_held = true;
+    n = ++g.call_counter;
+    pthread_mutex_unlock(&g.lock);
 
     fm_timestamp_compact(stamp, sizeof(stamp));
-    snprintf(tag, sizeof(tag), "in-%u", ++g.call_counter);
+    snprintf(tag, sizeof(tag), "in-%u", n);
     snprintf(rx_file, sizeof(rx_file), "%s/fax-%s-%s.tif", g.cfg.output_dir, stamp, tag);
 
     FM_INFO("sip", "inbound call %d from %s, answering (tag=%s -> %s)", (int) call_id, from, tag, rx_file);
@@ -457,11 +611,17 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     {
         FM_ERROR("sip", "could not set up the receiver, rejecting call %d", (int) call_id);
         pjsua_call_hangup(call_id, PJSIP_SC_INTERNAL_SERVER_ERROR, NULL, NULL);
+        line_release();
         return;
     }
     c->call_id = call_id;
-    g.active = c;
+    /* Before it is active, so no callback can find it half set up. From
+     * here it belongs to the main thread, which reaps it. */
     pjsua_call_set_user_data(call_id, c);
+    pthread_mutex_lock(&g.lock);
+    g.active = c;
+    signal_change_locked();
+    pthread_mutex_unlock(&g.lock);
 
     fax_call_setting(&answer_cfg);
     pjsua_call_answer2(call_id, &answer_cfg, 180, NULL, NULL);
@@ -520,23 +680,36 @@ static void on_call_sdp_created(pjsua_call_id call_id, pjmedia_sdp_session *sdp,
 static void on_reg_state2(pjsua_acc_id acc_id, pjsua_reg_info *info)
 {
     struct pjsip_regc_cbparam *rp = info->cbparam;
+    bool ok = (rp->code / 100 == 2) && rp->expiration > 0;
 
     (void) acc_id;
+    pthread_mutex_lock(&g.lock);
     g.reg_done = true;
     g.reg_status = rp->code;
-    g.reg_ok = (rp->code / 100 == 2) && rp->expiration > 0;
+    g.reg_ok = ok;
+    signal_change_locked();
+    pthread_mutex_unlock(&g.lock);
 
-    if (g.reg_ok)
+    if (ok)
         FM_INFO("sip", "registered as %s (expires in %ds)", g.cfg.username, (int) rp->expiration);
     else if (rp->code / 100 == 2)
         FM_INFO("sip", "unregistered (%d)", rp->code);
     else
         FM_ERROR("sip", "registration failed: %d %.*s", rp->code, (int) rp->reason.slen, rp->reason.ptr);
-
-    signal_change();
 }
 
 /* ------------------------------------------------------------------ setup */
+
+/* 0 while REGISTER is unanswered, then 1 registered or -1 refused. */
+static int reg_result(void)
+{
+    int r;
+
+    pthread_mutex_lock(&g.lock);
+    r = !g.reg_done ? 0 : g.reg_ok ? 1 : -1;
+    pthread_mutex_unlock(&g.lock);
+    return r;
+}
 
 static int pjsip_level_for(const fm_config_t *cfg)
 {
@@ -798,29 +971,40 @@ int fm_sip_start(const fm_config_t *cfg)
     FM_INFO("sip", "registering %s at %s", id_uri, cfg->server);
     {
         int64_t deadline = fm_now_ms() + (int64_t) cfg->reg_timeout_s * 1000;
-        while (!g.reg_done && fm_now_ms() < deadline)
+        while (reg_result() == 0 && fm_now_ms() < deadline)
             wait_change_ms(200);
     }
-    if (!g.reg_done)
+    switch (reg_result())
     {
+    case 0:
         FM_ERROR("sip", "no answer to REGISTER within %ds", cfg->reg_timeout_s);
         return FM_EXIT_SIP;
-    }
-    if (!g.reg_ok)
+    case 1:
+        return FM_EXIT_OK;
+    default:
         return FM_EXIT_SIP;
-    return FM_EXIT_OK;
+    }
 }
 
 void fm_sip_stop(void)
 {
+    fm_call_t *c;
+    bool hang_up;
+
     if (!g.started)
         return;
-    if (g.active != NULL)
+    pthread_mutex_lock(&g.lock);
+    c = g.active;
+    g.active = NULL;
+    g.inbound_enabled = false;
+    hang_up = (c != NULL && c->call_id != PJSUA_INVALID_ID && !c->disconnected);
+    pthread_mutex_unlock(&g.lock);
+    if (c != NULL)
     {
-        if (g.active->call_id != PJSUA_INVALID_ID)
-            pjsua_call_hangup(g.active->call_id, 0, NULL, NULL);
-        call_destroy(g.active);
-        g.active = NULL;
+        if (hang_up)
+            pjsua_call_hangup(c->call_id, 0, NULL, NULL);
+        call_destroy(c);
+        line_release();
     }
     if (g.acc_id != PJSUA_INVALID_ID && g.cfg.do_register)
         pjsua_acc_set_registration(g.acc_id, PJ_FALSE);
@@ -926,12 +1110,6 @@ int fm_sip_send_fax(const fm_config_t *cfg, const char *to, const char *file, co
     }
     fm_tiff_log(&info, file);
 
-    if (g.active != NULL)
-    {
-        FM_ERROR("send", "another call is already in progress");
-        return FM_EXIT_INTERNAL;
-    }
-
     build_request_uri(cfg, to, uri, sizeof(uri));
     if (pjsua_verify_sip_url(uri) != PJ_SUCCESS)
     {
@@ -939,11 +1117,22 @@ int fm_sip_send_fax(const fm_config_t *cfg, const char *to, const char *file, co
         return FM_EXIT_CONFIG;
     }
 
+    if (!line_take_outbound())
+    {
+        FM_ERROR("send", "another call is already in progress");
+        return FM_EXIT_INTERNAL;
+    }
+
     c = call_create(cfg, false, tag, file, NULL);
     if (c == NULL)
+    {
+        line_release();
         return FM_EXIT_INTERNAL;
+    }
     c->timeout_s = scaled_timeout(cfg, info.pages, tag);
+    pthread_mutex_lock(&g.lock);
     g.active = c;
+    pthread_mutex_unlock(&g.lock);
 
     fax_call_setting(&call_cfg);
 
@@ -962,47 +1151,49 @@ int fm_sip_send_fax(const fm_config_t *cfg, const char *to, const char *file, co
     dst = pjs(uri);
     FM_INFO("send", "calling %s (tag=%s, %d page%s)", uri, tag, info.pages, info.pages == 1 ? "" : "s");
 
+    /* pjsua takes c as the call's user data here, and its callbacks can run
+     * before this returns; they find c through it, and it is already
+     * active. */
     status = pjsua_call_make_call(g.acc_id, &dst, &call_cfg, c, &msg_data, &call_id);
     if (status != PJ_SUCCESS)
     {
         log_pj_error("pjsua_call_make_call", status);
         call_fill_result(c, result);
-        g.active = NULL;
-        call_destroy(c);
+        call_release(c);
         return FM_EXIT_CALL;
     }
     c->call_id = call_id;
 
     deadline = c->started_ms + (int64_t) c->timeout_s * 1000;
-    while (!c->disconnected && !fm_fax_completed(c->fax) && fm_now_ms() < deadline)
+    while (!call_disconnected(c) && !fm_fax_completed(c->fax) && fm_now_ms() < deadline)
     {
         wait_change_ms(200);
         if (call_stalled(c))
             break;
     }
 
-    if (c->stall_reason != NULL && !c->disconnected)
+    if (c->stall_reason != NULL && !call_disconnected(c))
     {
         pjsua_call_hangup(call_id, PJSIP_SC_REQUEST_TIMEOUT, NULL, NULL);
         int64_t grace = fm_now_ms() + FM_HANGUP_GRACE_MS;
-        while (!c->disconnected && fm_now_ms() < grace)
+        while (!call_disconnected(c) && fm_now_ms() < grace)
             wait_change_ms(100);
         timed_out = true;
     }
-    else if (fm_fax_completed(c->fax) && !c->disconnected)
+    else if (fm_fax_completed(c->fax) && !call_disconnected(c))
     {
         FM_INFO("send", "fax finished, hanging up call %d", (int) call_id);
         pjsua_call_hangup(call_id, PJSIP_SC_OK, NULL, NULL);
         int64_t grace = fm_now_ms() + FM_HANGUP_GRACE_MS;
-        while (!c->disconnected && fm_now_ms() < grace)
+        while (!call_disconnected(c) && fm_now_ms() < grace)
             wait_change_ms(100);
     }
-    else if (!c->disconnected)
+    else if (!call_disconnected(c))
     {
         FM_ERROR("send", "timed out after %ds, tearing the call down", c->timeout_s);
         pjsua_call_hangup(call_id, PJSIP_SC_REQUEST_TIMEOUT, NULL, NULL);
         int64_t grace = fm_now_ms() + FM_HANGUP_GRACE_MS;
-        while (!c->disconnected && fm_now_ms() < grace)
+        while (!call_disconnected(c) && fm_now_ms() < grace)
             wait_change_ms(100);
         timed_out = true;
     }
@@ -1025,8 +1216,7 @@ int fm_sip_send_fax(const fm_config_t *cfg, const char *to, const char *file, co
                  result->t30_text, result->pages, result->bit_rate, result->ecm ? "yes" : "no",
                  result->remote_ident, result->duration_ms, rc);
 
-    g.active = NULL;
-    call_destroy(c);
+    call_release(c);
     return rc;
 }
 
@@ -1034,24 +1224,52 @@ int fm_sip_send_fax(const fm_config_t *cfg, const char *to, const char *file, co
 
 void fm_sip_set_inbound(bool enabled)
 {
+    pthread_mutex_lock(&g.lock);
     g.inbound_enabled = enabled;
+    pthread_mutex_unlock(&g.lock);
     FM_INFO("sip", "inbound calls %s", enabled ? "will be answered" : "will be rejected");
 }
 
 bool fm_sip_call_active(void)
 {
-    return g.active != NULL;
+    bool held;
+
+    pthread_mutex_lock(&g.lock);
+    held = g.line_held;
+    pthread_mutex_unlock(&g.lock);
+    return held;
+}
+
+bool fm_sip_reserve_line(void)
+{
+    return line_take_outbound();
+}
+
+void fm_sip_release_line(void)
+{
+    bool ours;
+
+    pthread_mutex_lock(&g.lock);
+    ours = g.outbound_held && g.active == NULL;
+    pthread_mutex_unlock(&g.lock);
+    if (ours)
+        line_release();
 }
 
 void fm_sip_poll_inbound(void)
 {
-    fm_call_t *c = g.active;
+    fm_call_t *c;
     fm_call_result_t result;
 
+    /* An inbound context, once in g.active, is the main thread's to free, so
+     * it stays valid after the lock is dropped. */
+    pthread_mutex_lock(&g.lock);
+    c = g.active;
+    pthread_mutex_unlock(&g.lock);
     if (c == NULL || !c->inbound)
         return;
 
-    if (!c->disconnected)
+    if (!call_disconnected(c))
     {
         bool done = fm_fax_completed(c->fax);
         bool stalled = call_stalled(c);
@@ -1070,9 +1288,9 @@ void fm_sip_poll_inbound(void)
              * call down ourselves if it overstays. */
             int64_t linger = fm_now_ms() + FM_RX_LINGER_MS;
             FM_INFO("receive", "inbound fax %s finished, waiting for the caller to clear", c->tag);
-            while (!c->disconnected && fm_now_ms() < linger)
+            while (!call_disconnected(c) && fm_now_ms() < linger)
                 wait_change_ms(100);
-            if (c->disconnected)
+            if (call_disconnected(c))
                 goto reap;
             FM_DEBUG("receive", "caller %s did not hang up, clearing the call", c->tag);
         }
@@ -1080,7 +1298,7 @@ void fm_sip_poll_inbound(void)
         pjsua_call_hangup(c->call_id, done ? PJSIP_SC_OK : PJSIP_SC_REQUEST_TIMEOUT, NULL, NULL);
 
         int64_t grace = fm_now_ms() + FM_HANGUP_GRACE_MS;
-        while (!c->disconnected && fm_now_ms() < grace)
+        while (!call_disconnected(c) && fm_now_ms() < grace)
             wait_change_ms(100);
     }
 
@@ -1095,8 +1313,7 @@ reap:
     if (result.t30_result != 0 && fm_file_exists(c->rx_file))
         FM_WARN("receive", "%s may be incomplete", c->rx_file);
 
-    g.active = NULL;
-    call_destroy(c);
+    call_release(c);
 }
 
 int fm_sip_run_inbound(const fm_config_t *cfg, volatile sig_atomic_t *stop)
