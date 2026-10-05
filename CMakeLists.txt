@@ -61,6 +61,7 @@ add_executable(faxmodem
   src/v34_dsp.c
   src/v34_info.c
   src/v34_cc.c
+  src/v34hdx.c
 )
 
 target_include_directories(faxmodem PRIVATE include "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -171,3 +172,15 @@ if(UNIX AND NOT APPLE)
   target_link_libraries(v34test PRIVATE m)
 endif()
 add_test(NAME v34 COMMAND v34test)
+
+# Two half-duplex V.34 modems back to back over a simulated line: start-up,
+# the control channel both ways, pages on the primary channel.
+add_executable(v34hdxtest tests/v34hdx_test.c src/v34hdx.c src/v34_cc.c src/v34_codec.c src/v34_info.c
+               src/v34_dsp.c src/log.c src/util.c)
+target_include_directories(v34hdxtest PRIVATE src include "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_compile_options(v34hdxtest PRIVATE -Wall -Wextra -Wno-unused-parameter -Wshadow)
+target_link_libraries(v34hdxtest PRIVATE PkgConfig::SPANDSP PkgConfig::TIFF Threads::Threads)
+if(UNIX AND NOT APPLE)
+  target_link_libraries(v34hdxtest PRIVATE m)
+endif()
+add_test(NAME v34hdx COMMAND v34hdxtest)

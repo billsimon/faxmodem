@@ -118,6 +118,8 @@ typedef struct
     float theta, nu;
     float mse;
     bool trained;                       /* the equaliser has been set up from the signal's level */
+    int since_on;                       /* symbols since the carrier came on */
+    int bad_run;                        /* symbols the decisions have been poor for */
     int zprev;
     uint32_t dscr;
     long long symbols;

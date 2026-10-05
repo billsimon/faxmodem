@@ -232,6 +232,18 @@ static float pph_corr(const v34_ccrx_t *r, long long idx, v34_cf_t *gain, int *s
     return best;
 }
 
+/* The main tap from the signal's level alone; the phase is the phase loop's
+ * to find, and its four-fold ambiguity is harmless. */
+static void rescale(v34_ccrx_t *r)
+{
+    memset(r->c, 0, sizeof(r->c));
+    r->c[EQ_C] = 1.0f / sqrtf(r->pwr_sym);
+    r->theta = r->nu = 0.0f;
+    r->mse = 1.0f;
+    r->bad_run = 0;
+    r->trained = true;
+}
+
 static int symbol(v34_ccrx_t *r, v34_cf_t y)
 {
     v34_cf_t vout = 0.0f, u, d, err;
@@ -243,19 +255,17 @@ static int symbol(v34_ccrx_t *r, v34_cf_t y)
     r->line[r->lpos] = y;
     r->line[r->lpos + V34_CC_EQ] = y;
     w = &r->line[r->lpos];
+    r->since_on++;
     if (!r->trained)
     {
         /* Until something better is known, the main tap scales the signal
-         * to unit size; the phase loop and the decisions do the rest. */
-        float p = r->pwr_sym > 0.0f ? r->pwr_sym : crealf(y) * crealf(y) + cimagf(y) * cimagf(y);
-
-        if (p <= 0.0f)
+         * to unit size; the phase loop and the decisions do the rest. Not
+         * before the level has settled: set up on the first symbol out of a
+         * silence, it came out thousands of times too big, and every
+         * decision after that was too far off to learn from. */
+        if (r->since_on < 8 || r->pwr_sym <= 0.0f)
             return 0;
-        memset(r->c, 0, sizeof(r->c));
-        r->c[EQ_C] = 1.0f / sqrtf(p);
-        r->theta = r->nu = 0.0f;
-        r->mse = 1.0f;
-        r->trained = true;
+        rescale(r);
     }
     for (int i = 0; i < V34_CC_EQ; i++)
         vout += r->c[i] * w[i];
@@ -268,6 +278,17 @@ static int symbol(v34_ccrx_t *r, v34_cf_t y)
         float pe = cimagf(u * conjf(d));
 
         r->mse += 0.05f * (e2 - r->mse);
+        /* Decisions that stay this bad mean the scale is wrong, whatever
+         * set it: start again from the level. */
+        if (r->mse > 0.8f)
+        {
+            if (++r->bad_run >= 32)
+                rescale(r);
+        }
+        else
+        {
+            r->bad_run = 0;
+        }
         r->theta += 0.08f * pe + r->nu;
         r->nu += 0.002f * pe;
         if (r->nu > 0.05f)
@@ -312,6 +333,8 @@ static int half(v34_ccrx_t *r, v34_cf_t y)
     if (!r->carrier && r->pwr > on)
     {
         r->carrier = true;
+        r->trained = false;
+        r->since_on = 0;
     }
     else if (r->carrier && r->pwr < off)
     {
@@ -362,6 +385,9 @@ static int half(v34_ccrx_t *r, v34_cf_t y)
             {
                 r->s_seen = false;
                 r->sbar_at = idx;
+                /* The level is the far end's own now, not a silence's. */
+                if (r->pwr_sym > 0.0f)
+                    rescale(r);
                 ev |= V34_CC_EV_SHBAR;
             }
         }
@@ -409,7 +435,7 @@ static int half(v34_ccrx_t *r, v34_cf_t y)
         float sp = r->pwr_sym > 0.0f ? r->pwr_sym : p;
         double kp = (r->symbols < 40) ? 0.06 : 0.015;
 
-        r->pwr_sym += 0.05f * (p - r->pwr_sym);
+        r->pwr_sym += 0.1f * (p - r->pwr_sym);
         if (sp > 0.0f)
         {
             e /= sp;

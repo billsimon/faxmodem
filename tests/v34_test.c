@@ -606,6 +606,76 @@ static void test_dpsk(void)
     CHECK(fails == 0, "%d of 120 DPSK INFO sequences lost", fails);
 }
 
+/* Half duplex's Phase 2 reversals (12.2.1): tone, a reversal, only 10 ms
+ * more of the tone, then silence - or, from the calling modem, L1. The
+ * receiver must still see the reversal, and place it to within a
+ * millisecond, for the round trip. */
+static int reversal_once(bool answerer, int delay, int offset, double noise_db, bool then_l1, double *err_ms)
+{
+    static v34_p2tx_t tx;
+    static v34_p2rx_t rx;
+    static float line[8192];
+    long long rev_at = 2400 + offset;
+    double nrms = V34_DBM0_RMS * pow(10.0, noise_db / 20.0);
+    int got = 0;
+
+    v34_p2tx_init(&tx, answerer, -13.0);
+    v34_p2rx_init(&rx, answerer);
+    v34_p2tx_carrier(&tx, true);
+    v34_p2tx_reverse_at(&tx, rev_at);
+    memset(line, 0, sizeof(line));
+    for (long long t = 0; t < 6000; t++)
+    {
+        double when;
+
+        if (t == rev_at + 80)
+        {
+            v34_p2tx_carrier(&tx, false);
+            if (then_l1)
+                v34_p2tx_probe(&tx, true, true, -13.0);
+        }
+        line[t & 8191] = v34_p2tx_sample(&tx, t);
+        if (v34_p2rx_sample(&rx, (float) ((t >= delay ? line[(t - delay) & 8191] : 0.0f) + nrms * gauss()), t, &when) &&
+            !got)
+        {
+            got = 1;
+            *err_ms = (when - (double) (rev_at + delay)) / 8.0;
+        }
+        for (int k = 0; k < V34_P2_PHASES; k++)
+            rx.nbits[k] = 0;
+    }
+    return got;
+}
+
+static void test_reversals(void)
+{
+    int fails = 0, runs = 0;
+    double worst = 0.0;
+
+    for (int ans = 0; ans < 2; ans++)
+        for (int l1 = 0; l1 < 2; l1++)
+            for (int d = 0; d < 300; d += 23)
+                for (int off = 0; off < 10; off += 3)
+                    for (int nz = 0; nz < 2; nz++)
+                    {
+                        double e = 0.0;
+
+                        runs++;
+                        if (!reversal_once(ans, d, off, nz ? -45.0 : -90.0, l1, &e))
+                        {
+                            if (++fails <= 4)
+                                printf("  reversal on %s, then %s, delay %d, offset %d: not seen\n",
+                                       ans ? "2400 Hz" : "1200 Hz", l1 ? "L1" : "silence", d, off);
+                        }
+                        else if (fabs(e) > worst)
+                        {
+                            worst = fabs(e);
+                        }
+                    }
+    printf("  half-duplex reversals: %d of %d seen, placed to within %.2f ms\n", runs - fails, runs, worst);
+    CHECK(fails == 0 && worst < 1.0, "%d half-duplex reversals not seen, worst placement %.2f ms", fails, worst);
+}
+
 /* G.711 mu-law, as G.711 tabulates it: a line through a telephone network. */
 static uint8_t linear_to_ulaw(int16_t x)
 {
@@ -774,7 +844,7 @@ typedef struct
     uint32_t data_rng;
 } cctest_rx_t;
 
-static void cct_rx_bit(cctest_rx_t *r, int b)
+static void cct_rx_bit(cctest_rx_t *r, int b, bool symbol_end)
 {
     if (r->got_e)
     {
@@ -807,7 +877,8 @@ static void cct_rx_bit(cctest_rx_t *r, int b)
         r->nbuf = 18;
         r->in_mph = true;
     }
-    if (r->got_mph && r->ones == 20 && !r->in_mph)
+    /* E is ten whole symbols. */
+    if ((r->got_mph || r->shbar) && r->ones >= 20 && !r->in_mph && symbol_end)
         r->got_e = true;
 }
 
@@ -847,15 +918,18 @@ static int cc_once(bool far_answerer, int delay, double loss_db, double noise_db
     }
     else
     {
-        /* The resynchronisation of 12.6, then a retrain's AC. */
+        /* The resynchronisation of 12.6 - no PPh, so nothing to find the
+         * symbol clock by but what arrives - and data; then a retrain's AC. */
         t.prog[0] = CC_SIL, t.len[0] = 60;
         t.prog[1] = CC_SH, t.len[1] = 24;
         t.prog[2] = CC_SHB, t.len[2] = 8;
         t.prog[3] = CC_ALT, t.len[3] = 40;
-        t.prog[4] = CC_SIL, t.len[4] = 120;
-        t.prog[5] = CC_AC, t.len[5] = 150;
-        t.prog[6] = CC_END, t.len[6] = -1;
-        t.np = 7;
+        t.prog[4] = CC_E, t.len[4] = 10;
+        t.prog[5] = CC_DATA, t.len[5] = 1800;
+        t.prog[6] = CC_SIL, t.len[6] = 120;
+        t.prog[7] = CC_AC, t.len[7] = 150;
+        t.prog[8] = CC_END, t.len[8] = -1;
+        t.np = 9;
     }
     r.data_rng = 0x1234567u;
     r.data_limit = 2 * 1800;
@@ -900,7 +974,7 @@ static int cc_once(bool far_answerer, int delay, double loss_db, double noise_db
         if ((ev & V34_CC_EV_AC) && !r.ac)
             r.ac = 1;
         for (int i = 0; i < rx.nbits; i++)
-            cct_rx_bit(&r, rx.bits[i]);
+            cct_rx_bit(&r, rx.bits[i], (i & 1) == 1);
     }
     if (start)
     {
@@ -920,6 +994,10 @@ static int cc_once(bool far_answerer, int delay, double loss_db, double noise_db
     }
     if (!r.shbar)
         snprintf(why, why_len, "Sh and S-bar-h not recognised");
+    else if (!r.got_e)
+        snprintf(why, why_len, "no E after the resync");
+    else if (r.data_bits < r.data_limit || r.data_errs > 0)
+        snprintf(why, why_len, "%lld errors in %lld data bits after the resync", r.data_errs, r.data_bits);
     else if (!r.ac)
         snprintf(why, why_len, "AC not recognised");
     else
@@ -971,6 +1049,7 @@ int main(void)
     test_dpsk();
     test_pph();
     test_cc();
+    test_reversals();
     if (failures)
     {
         printf("%d FAILED\n", failures);
