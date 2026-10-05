@@ -698,6 +698,58 @@ static void on_reg_state2(pjsua_acc_id acc_id, pjsua_reg_info *info)
         FM_ERROR("sip", "registration failed: %d %.*s", rp->code, (int) rp->reason.slen, rp->reason.ptr);
 }
 
+/* ------------------------------------------------------------------- gate */
+
+/* Rejects a new INVITE we would refuse anyway - inbound off, or the line
+ * held - before pjsua sees it. pjsua gives every incoming INVITE a call slot
+ * and an RTP and RTCP socket before on_incoming_call can say no, and pjlib
+ * keeps a closed socket's slot for half a second: a few hundred INVITEs a
+ * second - a SIP scanner finding a public address - ran out its 64 and pjlib
+ * asserted, taking the process with it. Refused here, an INVITE costs one
+ * transaction and nothing else. on_incoming_call still makes the decision
+ * that counts, under the lock, for anything that gets past in the instant
+ * the line is taken. */
+static pj_bool_t gate_on_rx_request(pjsip_rx_data *rdata)
+{
+    const pjsip_msg *msg = rdata->msg_info.msg;
+    int code = 0;
+    char from[160];
+    int n;
+
+    if (msg->line.req.method.id != PJSIP_INVITE_METHOD)
+        return PJ_FALSE;
+    if (rdata->msg_info.to == NULL || rdata->msg_info.to->tag.slen != 0)
+        return PJ_FALSE; /* within a dialog: a re-INVITE, ours to keep */
+
+    pthread_mutex_lock(&g.lock);
+    if (!g.inbound_enabled)
+        code = PJSIP_SC_NOT_ACCEPTABLE_HERE;
+    else if (g.line_held)
+        code = PJSIP_SC_BUSY_HERE;
+    pthread_mutex_unlock(&g.lock);
+    if (code == 0)
+        return PJ_FALSE;
+
+    n = pjsip_uri_print(PJSIP_URI_IN_FROMTO_HDR, rdata->msg_info.from->uri, from, sizeof(from) - 1);
+    from[n > 0 ? n : 0] = '\0';
+    if (code == PJSIP_SC_BUSY_HERE)
+        FM_WARN("sip", "rejecting inbound call from %s: another fax is in progress", from);
+    else
+        FM_INFO("sip", "rejecting inbound call from %s: not accepting calls", from);
+    /* Statefully, so that retransmissions and the ACK are absorbed. */
+    pjsip_endpt_respond(pjsua_get_pjsip_endpt(), NULL, rdata, code, NULL, NULL, NULL, NULL);
+    return PJ_TRUE;
+}
+
+static pjsip_module g_gate = {
+    .name = {"mod-faxmodem-gate", 17},
+    .id = -1,
+    /* After the transaction and dialog layers, which take retransmissions
+     * and in-dialog requests; before pjsua, at PJSIP_MOD_PRIORITY_APPLICATION. */
+    .priority = PJSIP_MOD_PRIORITY_APPLICATION - 1,
+    .on_rx_request = &gate_on_rx_request,
+};
+
 /* ------------------------------------------------------------------ setup */
 
 /* 0 while REGISTER is unanswered, then 1 registered or -1 refused. */
@@ -810,7 +862,11 @@ int fm_sip_start(const fm_config_t *cfg)
     g.started = true;
 
     pjsua_config_default(&ua_cfg);
-    ua_cfg.max_calls = 2;
+    /* One fax at a time is enforced by the line, not here. These are pjsua's
+     * slots, and a call can hold one well after we are done with it - a far
+     * end that never answers our CANCEL keeps it for half a minute - so
+     * leave room for the next fax to be placed meanwhile. */
+    ua_cfg.max_calls = 4;
     ua_cfg.cb.on_call_state = &on_call_state;
     ua_cfg.cb.on_call_media_state = &on_call_media_state;
     ua_cfg.cb.on_incoming_call = &on_incoming_call;
@@ -856,6 +912,12 @@ int fm_sip_start(const fm_config_t *cfg)
     if (status != PJ_SUCCESS)
     {
         log_pj_error("pjsua_init", status);
+        return FM_EXIT_INTERNAL;
+    }
+    status = pjsip_endpt_register_module(pjsua_get_pjsip_endpt(), &g_gate);
+    if (status != PJ_SUCCESS)
+    {
+        log_pj_error("pjsip_endpt_register_module", status);
         return FM_EXIT_INTERNAL;
     }
 
