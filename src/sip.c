@@ -1010,6 +1010,12 @@ int fm_sip_start(const fm_config_t *cfg)
         FM_INFO("sip", "media ports %d-%d must be reachable from the far end", cfg->rtp_port,
                 cfg->rtp_port + cfg->rtp_port_range);
     }
+    /* The SIP transport's public_addr only reaches Via and Contact; the SDP
+     * c= line comes from the media transport, which has its own. Without
+     * this the far end sends RTP to our private address and the call is
+     * silent one way. */
+    if (cfg->public_addr[0] != '\0')
+        acc_cfg.rtp_cfg.public_addr = pjs(cfg->public_addr);
     acc_cfg.vid_in_auto_show = PJ_FALSE;
     acc_cfg.vid_out_auto_transmit = PJ_FALSE;
 
